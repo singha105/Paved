@@ -29,6 +29,13 @@ const (
 	ConditionReady           = "Ready"
 )
 
+// Tiers a ServiceClaim can request. Each tier maps to a fixed set of managed resources.
+const (
+	TierPublic   = "public"
+	TierInternal = "internal"
+	TierBatch    = "batch"
+)
+
 // ServiceClaimSpec is everything a developer declares about a service. Resource limits,
 // security context, rollout strategy, probes and canary steps are deliberately absent:
 // the platform owns them (DECISIONS.md, ADR-001).

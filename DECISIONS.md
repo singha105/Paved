@@ -113,3 +113,58 @@ matching namespace selectors already default to every namespace.
   Helm release name, so the builders don't depend on how Prometheus was installed.
 - Any namespace can add scrape targets and rules to this Prometheus. That is acceptable for
   a cluster the platform team owns.
+
+---
+
+## ADR-006: Managed objects are tied to their claim by labels and a finalizer, not owner references
+
+**Status:** Accepted (Day 2)
+
+**Context.** A claim lives in `platform-claims`, but its objects live in `svc-<name>`, and
+that Namespace is cluster-scoped. Kubernetes only honours an owner reference to an owner in
+the same namespace, or to a cluster-scoped owner. controller-runtime's
+`SetControllerReference` refuses the cross-namespace case outright. A hand-written owner
+reference is worse: on Day 2, a ConfigMap in another namespace carrying an owner reference
+to a claim was deleted by the garbage collector within one second (event
+`OwnerRefInvalidNamespace`). Following the original plan (an owner reference on every object,
+plus `Owns()` watches) would have had the garbage collector delete every managed object as
+fast as the controller created it.
+
+**Decision.** Managed objects carry no owner references. Each one is labelled
+`paved.dev/claim` and `paved.dev/claim-namespace`, alongside `app.kubernetes.io/name`,
+`app.kubernetes.io/managed-by: paved` and `paved.dev/owner`. The controller watches every
+managed type and maps each event back to a claim through those two labels. A finalizer,
+`paved.dev/finalizer`, deletes `svc-<name>`, which removes everything inside it, and is
+removed only once the namespace is gone.
+
+**Consequences.**
+- Drift still triggers a reconcile: deleting or editing a managed object queues its claim,
+  and the next apply puts the object back.
+- Cleanup is the controller's job, not the garbage collector's. If the controller is down, a
+  deleted claim stays in `Terminating` until it comes back.
+- There is one label more than the original four, because a claim name alone doesn't say
+  which namespace the claim is in.
+
+---
+
+## ADR-007: NetworkPolicy lets Prometheus in and leaves egress open
+
+**Status:** Accepted (Day 2)
+
+**Context.** Each claim's namespace denies incoming traffic by default. Public claims accept
+traffic from the ingress controller; internal claims accept only the platform namespace and
+their own namespace. Prometheus runs in `monitoring`, so a strict reading would block its
+scrapes. k3s enforces NetworkPolicy, so the workload would produce no SLI metrics, burn
+rate could never be computed, and deploys could never freeze. The original rule "egress
+always allows DNS", read as "egress allows only DNS", would also break any service that
+calls out, and `webhook-delivery` exists to call external URLs.
+
+**Decision.** Each policy restricts ingress only. Every tier admits `monitoring` on the
+service port. Public and internal also admit their own namespace and `platform-system`;
+public additionally admits `traefik` on the service port. Egress is not restricted, so DNS
+is always reachable.
+
+**Consequences.**
+- Prometheus can scrape every claimed workload, whatever its tier.
+- A compromised pod can open outbound connections anywhere. Restricting egress properly needs
+  a per-service list of allowed destinations, which the `v1alpha1` API does not have.
