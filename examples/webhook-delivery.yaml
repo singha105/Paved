@@ -1,0 +1,20 @@
+# Placeholder values: owner, image and SLO numbers stand in until the service is built.
+apiVersion: platform.paved.dev/v1alpha1
+kind: ServiceClaim
+metadata:
+  name: webhook-delivery
+  namespace: platform-claims
+spec:
+  owner: team-integrations
+  image: ghcr.io/singha105/webhook-delivery:0.1.0
+  port: 8080
+  tier: public
+  sli:
+    type: http-latency
+    latencyThreshold: 250ms
+  slo:
+    objective: "99.0"
+    window: 7d
+  scale:
+    min: 2
+    max: 4

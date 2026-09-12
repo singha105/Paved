@@ -1,0 +1,19 @@
+# Placeholder values: owner, image and SLO numbers stand in until the service is built.
+apiVersion: platform.paved.dev/v1alpha1
+kind: ServiceClaim
+metadata:
+  name: url-shortener
+  namespace: platform-claims
+spec:
+  owner: team-links
+  image: ghcr.io/singha105/url-shortener:0.1.0
+  port: 8080
+  tier: public
+  sli:
+    type: http-availability
+  slo:
+    objective: "99.5"
+    window: 28d
+  scale:
+    min: 2
+    max: 5

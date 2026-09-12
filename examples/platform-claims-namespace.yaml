@@ -1,0 +1,6 @@
+# Developers submit ServiceClaims here. Each claim is reconciled into its own
+# generated namespace, svc-<claim-name>.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-claims
