@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -77,7 +78,7 @@ var _ = Describe("ServiceClaim Controller", func() {
 			By("Cleanup the specific resource instance ServiceClaim")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
-		It("should successfully reconcile the resource", func() {
+		It("should set Ready=False with reason NotImplemented", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &ServiceClaimReconciler{
 				Client: k8sClient,
@@ -88,8 +89,27 @@ var _ = Describe("ServiceClaim Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("Checking the Ready condition")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, serviceclaim)).To(Succeed())
+			ready := meta.FindStatusCondition(serviceclaim.Status.Conditions, platformv1alpha1.ConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonNotImplemented))
+			Expect(ready.ObservedGeneration).To(Equal(serviceclaim.Generation))
+		})
+
+		It("should do nothing for a ServiceClaim that no longer exists", func() {
+			controllerReconciler := &ServiceClaimReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "does-not-exist", Namespace: resourceNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
 		})
 	})
 })
