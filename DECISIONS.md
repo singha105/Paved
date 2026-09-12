@@ -168,3 +168,35 @@ is always reachable.
 - Prometheus can scrape every claimed workload, whatever its tier.
 - A compromised pod can open outbound connections anywhere. Restricting egress properly needs
   a per-service list of allowed destinations, which the `v1alpha1` API does not have.
+
+---
+
+## ADR-008: The HPA owns the replica count, and tier floors never produce an invalid object
+
+**Status:** Accepted (Day 2)
+
+**Context.** Each tier sets a replica floor (a public service never runs fewer than two pods)
+and the developer sets `scale.max`. The obvious implementation breaks in three ways:
+- If the Rollout the controller applies includes `spec.replicas`, every reconcile resets the
+  count and undoes whatever the HPA just decided.
+- A public claim with `scale.max: 1` would produce an HPA with `minReplicas: 2` and
+  `maxReplicas: 1`, which the API server rejects.
+- A PodDisruptionBudget with `minAvailable: 1` on a single-replica service permits no
+  evictions, so every node drain hangs.
+
+**Decision.**
+- For tiers with an HPA (public and internal), the Rollout leaves `spec.replicas` unset. Batch
+  has no HPA and sets it to 1.
+- The HPA's `minReplicas` is the tier floor and its `maxReplicas` is the larger of
+  `scale.max` and that floor.
+- The PodDisruptionBudget uses `maxUnavailable: 1`.
+- The canary splits by replica count, without traffic routing, so it needs no separate
+  canary and stable Services.
+
+**Consequences.**
+- The controller and the HPA never fight over the replica count.
+- A public claim asking for at most one pod gets two. The floor is a platform guarantee, but
+  the claim's status doesn't yet say that its maximum was raised.
+- With only a few replicas the canary percentages are coarse, because they count pods, not
+  requests.
+- A public claim stays at 11 managed resources.
