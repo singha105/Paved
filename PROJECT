@@ -8,4 +8,14 @@ layout:
 - go.kubebuilder.io/v4
 projectName: paved
 repo: github.com/singha105/paved
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: paved.dev
+  group: platform
+  kind: ServiceClaim
+  path: github.com/singha105/paved/api/v1alpha1
+  version: v1alpha1
 version: "3"

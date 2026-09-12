@@ -1,0 +1,9 @@
+apiVersion: platform.paved.dev/v1alpha1
+kind: ServiceClaim
+metadata:
+  labels:
+    app.kubernetes.io/name: paved
+    app.kubernetes.io/managed-by: kustomize
+  name: serviceclaim-sample
+spec:
+  # TODO(user): Add fields here
