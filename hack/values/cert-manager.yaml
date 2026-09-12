@@ -1,0 +1,5 @@
+# cert-manager values for the local paved cluster.
+crds:
+  # Install cert-manager's CRDs with the release. The operator's admission webhook
+  # gets its serving certificate from cert-manager.
+  enabled: true

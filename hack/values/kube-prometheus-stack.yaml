@@ -1,0 +1,9 @@
+# kube-prometheus-stack values for the local paved cluster.
+prometheus:
+  prometheusSpec:
+    # By default Prometheus only selects ServiceMonitors, PodMonitors and PrometheusRules
+    # that carry this Helm release's label. The paved controller generates those objects
+    # in per-claim namespaces without that label, so select all of them instead.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
