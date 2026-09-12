@@ -21,48 +21,94 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// Condition types reported in ServiceClaimStatus.Conditions.
+const (
+	ConditionResourcesSynced = "ResourcesSynced"
+	ConditionSLOHealthy      = "SLOHealthy"
+	ConditionDeploysFrozen   = "DeploysFrozen"
+	ConditionReady           = "Ready"
+)
 
-// ServiceClaimSpec defines the desired state of ServiceClaim
+// ServiceClaimSpec is everything a developer declares about a service. Resource limits,
+// security context, rollout strategy, probes and canary steps are deliberately absent:
+// the platform owns them (DECISIONS.md, ADR-001).
 type ServiceClaimSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	// +kubebuilder:validation:MinLength=1
+	Owner string `json:"owner"`
 
-	// foo is an example field of ServiceClaim. Edit serviceclaim_types.go to remove/update
-	// +optional
-	Foo *string `json:"foo,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	Image string `json:"image"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+
+	// +kubebuilder:validation:Enum=public;internal;batch
+	Tier string `json:"tier"`
+
+	SLI   SLISpec   `json:"sli"`
+	SLO   SLOSpec   `json:"slo"`
+	Scale ScaleSpec `json:"scale"`
 }
 
-// ServiceClaimStatus defines the observed state of ServiceClaim.
+// SLISpec selects how "good" requests are measured.
+type SLISpec struct {
+	// +kubebuilder:validation:Enum=http-availability;http-latency
+	Type string `json:"type"`
+	// Statuses counted as "good". Used by http-availability.
+	// +kubebuilder:default={200,201,204,301,302,304,400,404}
+	GoodStatuses []int32 `json:"goodStatuses,omitempty"`
+	// Latency threshold for http-latency, e.g. "250ms".
+	// +kubebuilder:default="250ms"
+	LatencyThreshold string `json:"latencyThreshold,omitempty"`
+}
+
+// SLOSpec is the objective the error budget is computed from.
+type SLOSpec struct {
+	// Target availability percentage, e.g. 99.5. A string, not a float, per Kubernetes
+	// API conventions; the range is checked by CEL because Minimum/Maximum only apply
+	// to numeric schema types (DECISIONS.md, ADR-004).
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
+	// +kubebuilder:validation:XValidation:rule="double(self) >= 90.0 && double(self) < 100.0",message="objective must be at least 90 and less than 100"
+	Objective string `json:"objective"` // resource.Quantity-style string, parse it
+	// +kubebuilder:validation:Enum=7d;28d;30d
+	// +kubebuilder:default="28d"
+	Window string `json:"window,omitempty"`
+}
+
+// ScaleSpec bounds replica autoscaling. The tier may raise the minimum.
+type ScaleSpec struct {
+	// +kubebuilder:validation:Minimum=1
+	Min int32 `json:"min"`
+	// +kubebuilder:validation:Minimum=1
+	Max int32 `json:"max"`
+}
+
+// ServiceClaimStatus is what the controller last observed and decided.
 type ServiceClaimStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the ServiceClaim resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	Conditions           []metav1.Condition `json:"conditions,omitempty"`
+	ErrorBudgetRemaining string             `json:"errorBudgetRemaining,omitempty"` // "62%"
+	BurnRate1h           string             `json:"burnRate1h,omitempty"`
+	ManagedResources     int                `json:"managedResources,omitempty"`
+	ObservedGeneration   int64              `json:"observedGeneration,omitempty"`
+	LastReconcileTime    *metav1.Time       `json:"lastReconcileTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:printcolumn:name="Tier",type=string,JSONPath=`.spec.tier`
+// +kubebuilder:printcolumn:name="Owner",type=string,JSONPath=`.spec.owner`
+// +kubebuilder:printcolumn:name="Budget",type=string,JSONPath=`.status.errorBudgetRemaining`
+// +kubebuilder:printcolumn:name="Frozen",type=string,JSONPath=`.status.conditions[?(@.type=="DeploysFrozen")].status`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// ServiceClaim is the Schema for the serviceclaims API
+// ServiceClaim is one developer's request for a production-shaped service. The
+// controller reconciles it into its own namespace, svc-<name>.
 type ServiceClaim struct {
 	metav1.TypeMeta `json:",inline"`
 

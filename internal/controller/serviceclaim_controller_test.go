@@ -54,7 +54,15 @@ var _ = Describe("ServiceClaim Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: platformv1alpha1.ServiceClaimSpec{
+						Owner: "team-test",
+						Image: "registry.example.com/test:1.0.0",
+						Port:  8080,
+						Tier:  "internal",
+						SLI:   platformv1alpha1.SLISpec{Type: "http-availability"},
+						SLO:   platformv1alpha1.SLOSpec{Objective: "99.5"},
+						Scale: platformv1alpha1.ScaleSpec{Min: 1, Max: 3},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
