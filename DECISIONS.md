@@ -205,7 +205,7 @@ and the developer sets `scale.max`. The obvious implementation breaks in three w
 
 ## ADR-009: A small demo app stands in for the example services
 
-**Status:** Accepted (Day 2)
+**Status:** Superseded by ADR-012 (Day 3)
 
 **Context.** The example claims pointed at images that don't exist yet. Pods that can't pull
 their image never become ready, and Argo Rollouts may keep updating the Rollout's status
@@ -286,3 +286,29 @@ carries two annotations: `runbook_url`, which links to the general guidance in
   original table. The builder tests and the envtest suite assert the new counts.
 - Reading a service's own runbook takes a `kubectl` command; only the general guidance is a
   clickable link.
+
+---
+
+## ADR-012: The test service is pushed to a registry the cluster pulls from
+
+**Status:** Accepted (Day 3). Supersedes ADR-009.
+
+**Context.** The SLO rules and burn-rate alerts can only be proven against a workload whose
+errors can be produced on demand. The Day 2 demo app met the platform's pod contract, but it
+was loaded with `k3d image import`, which copies an image straight into the node. A real deploy
+pushes an image to a registry and the cluster pulls it, and k3d can only connect a registry
+to a cluster when the cluster is created.
+
+**Decision.** The demo app moves to `examples/testsvc` and gains `GET /boom`, which answers 500
+and is counted like any other request. `hack/cluster-up.sh` creates a k3d registry,
+`k3d-paved-registry`, on `localhost:5001` (port 5000 is taken by macOS AirPlay Receiver) and
+creates the cluster connected to it. If an existing cluster isn't connected, the script stops
+and prints how to recreate it rather than deleting anything itself. `hack/testsvc-image.sh`
+builds the image and pushes it to `localhost:5001/testsvc:<tag>`; claims reference it as
+`k3d-paved-registry:5001/testsvc:<tag>`, which the node's registry mirror resolves.
+
+**Consequences.**
+- Changing a claim's image is a real push and pull, the same path a production deploy takes.
+- The cluster had to be recreated once, from the script, to attach the registry.
+- One registry has two names: `localhost:5001` from the laptop, `k3d-paved-registry:5001` from pods.
+- Pushed images survive a cluster rebuild, as long as the registry container isn't deleted.

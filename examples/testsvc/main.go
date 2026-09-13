@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command demo-app is a minimal HTTP service that meets the paved workload contract: it
-// serves /healthz and /readyz for the platform's probes and /metrics for Prometheus, runs
-// as a non-root user and writes nothing to disk. The example ServiceClaims run it until
-// real services replace it (DECISIONS.md, ADR-009).
+// Command testsvc is a small HTTP service that meets the paved service contract: it serves
+// /healthz and /readyz for the platform's probes and /metrics for Prometheus, runs as a
+// non-root user and writes nothing to disk. GET /boom answers 500, so the SLO rules and
+// burn-rate alerts can be exercised on demand. The example ServiceClaims run it
+// (DECISIONS.md, ADR-012).
 package main
 
 import (
@@ -63,11 +64,13 @@ func run(addr string) error {
 		}
 	}
 
-	// Probe and scrape requests are not counted, so they never dilute the SLI.
-	app := promhttp.InstrumentHandlerDuration(latency,
-		promhttp.InstrumentHandlerCounter(requests, http.HandlerFunc(ok)))
+	// Only application requests are counted: probes and scrapes would dilute the SLI.
+	instrument := func(handler http.HandlerFunc) http.Handler {
+		return promhttp.InstrumentHandlerDuration(latency, promhttp.InstrumentHandlerCounter(requests, handler))
+	}
 	mux := http.NewServeMux()
-	mux.Handle("/", app)
+	mux.Handle("/", instrument(ok))
+	mux.Handle("/boom", instrument(boom))
 	mux.HandleFunc("/healthz", ok)
 	mux.HandleFunc("/readyz", ok)
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
@@ -105,4 +108,9 @@ func ok(w http.ResponseWriter, _ *http.Request) {
 	if _, err := fmt.Fprintln(w, "ok"); err != nil {
 		log.Printf("Failed to write response: %v", err)
 	}
+}
+
+// boom answers 500, to spend error budget on purpose.
+func boom(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "boom", http.StatusInternalServerError)
 }

@@ -1,5 +1,5 @@
-# Owner and SLO values are placeholders. The image is the demo app (hack/demo-app.sh)
-# until the real service exists.
+# Owner and SLO values are placeholders. The image is the test service (examples/testsvc),
+# pushed to the cluster's registry by hack/testsvc-image.sh, until the real service exists.
 apiVersion: platform.paved.dev/v1alpha1
 kind: ServiceClaim
 metadata:
@@ -7,7 +7,7 @@ metadata:
   namespace: platform-claims
 spec:
   owner: team-integrations
-  image: paved-demo-app:0.1.0
+  image: k3d-paved-registry:5001/testsvc:0.1.0
   port: 8080
   tier: public
   sli:

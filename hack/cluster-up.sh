@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# cluster-up.sh: create the local "paved" k3d cluster and install the platform stack
-# (cert-manager, Traefik, Argo Rollouts, kube-prometheus-stack).
+# cluster-up.sh: create the local "paved" k3d cluster with its image registry, and install
+# the platform stack (cert-manager, Traefik, Argo Rollouts, kube-prometheus-stack).
 #
-# Idempotent: re-running reuses the existing cluster and upgrades each Helm release in
+# Idempotent: re-running reuses the registry and the cluster and upgrades each Helm release in
 # place. Readiness is checked with `kubectl wait`, never `sleep`.
 set -euo pipefail
 
@@ -11,6 +11,11 @@ CLUSTER_NAME="${CLUSTER_NAME:-paved}"
 KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600s}"
 VALUES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/values"
+
+# The registry is localhost:${REGISTRY_PORT} from this machine and ${REGISTRY}:${REGISTRY_PORT}
+# from inside the cluster. Port 5000 is taken by macOS AirPlay Receiver.
+REGISTRY="k3d-paved-registry"
+REGISTRY_PORT="${REGISTRY_PORT:-5001}"
 
 # Pinned on Day 1. PROGRESS.md records why these exact versions; change them together.
 K3S_IMAGE="rancher/k3s:v1.36.4-k3s1"
@@ -33,10 +38,28 @@ require_tools() {
   done
 }
 
+ensure_registry() {
+  if k3d registry list --no-headers 2>/dev/null | awk '{print $1}' | grep -qx "$REGISTRY"; then
+    log "Registry '$REGISTRY' exists; making sure it is running"
+    docker start "$REGISTRY" >/dev/null
+  else
+    log "Creating registry '$REGISTRY' on localhost:${REGISTRY_PORT}"
+    # k3d adds the "k3d-" prefix to the name it is given.
+    k3d registry create "${REGISTRY#k3d-}" --port "127.0.0.1:${REGISTRY_PORT}"
+  fi
+}
+
 ensure_cluster() {
   if k3d cluster get "$CLUSTER_NAME" >/dev/null 2>&1; then
     log "Cluster '$CLUSTER_NAME' exists; making sure it is running"
     k3d cluster start "$CLUSTER_NAME" --wait
+    if ! docker exec "k3d-${CLUSTER_NAME}-server-0" cat /etc/rancher/k3s/registries.yaml 2>/dev/null |
+      grep -q "$REGISTRY"; then
+      echo "error: cluster '$CLUSTER_NAME' is not connected to registry '$REGISTRY'." >&2
+      echo "       A registry can only be attached at creation. Recreate the cluster:" >&2
+      echo "       k3d cluster delete $CLUSTER_NAME && $0" >&2
+      exit 1
+    fi
   else
     log "Creating cluster '$CLUSTER_NAME' ($K3S_IMAGE)"
     # Traefik is installed with Helm into its own namespace below, so the k3s-bundled
@@ -46,6 +69,7 @@ ensure_cluster() {
       --servers 1 --agents 0 \
       --port "80:80@loadbalancer" \
       --port "443:443@loadbalancer" \
+      --registry-use "${REGISTRY}:${REGISTRY_PORT}" \
       --k3s-arg "--disable=traefik@server:*" \
       --wait
   fi
@@ -100,10 +124,11 @@ install_stack() {
 
 main() {
   require_tools
+  ensure_registry
   ensure_cluster
   add_repos
   install_stack
-  log "Cluster '$CLUSTER_NAME' is ready (kubectl context: $KUBE_CONTEXT)"
+  log "Cluster '$CLUSTER_NAME' is ready (kubectl context: $KUBE_CONTEXT, registry: localhost:$REGISTRY_PORT)"
 }
 
 main "$@"
