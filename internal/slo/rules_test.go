@@ -30,6 +30,9 @@ const (
 	testClaimName = "url-shortener"
 	testOwner     = "team-links"
 	testNamespace = "svc-url-shortener"
+
+	testObjective    = "99.5"
+	tighterObjective = "99.9"
 )
 
 var defaultGoodStatuses = []int32{200, 201, 204, 301, 302, 304, 400, 404}
@@ -48,7 +51,7 @@ func newClaim(sliType string) *platformv1alpha1.ServiceClaim {
 				GoodStatuses:     defaultGoodStatuses,
 				LatencyThreshold: "250ms",
 			},
-			SLO:   platformv1alpha1.SLOSpec{Objective: "99.5", Window: "28d"},
+			SLO:   platformv1alpha1.SLOSpec{Objective: testObjective, Window: "28d"},
 			Scale: platformv1alpha1.ScaleSpec{Min: 2, Max: 5},
 		},
 	}

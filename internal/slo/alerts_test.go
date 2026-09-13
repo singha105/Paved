@@ -83,7 +83,7 @@ func TestAlertRulesFollowTheWorkbookTable(t *testing.T) {
 
 func TestAlertThresholdsScaleWithTheObjective(t *testing.T) {
 	sc := newClaim(platformv1alpha1.SLIHTTPLatency)
-	sc.Spec.SLO.Objective = "99.9"
+	sc.Spec.SLO.Objective = tighterObjective
 	rules, err := AlertRules(sc, testRunbook)
 	if err != nil {
 		t.Fatal(err)
