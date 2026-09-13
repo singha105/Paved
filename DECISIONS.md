@@ -200,3 +200,30 @@ and the developer sets `scale.max`. The obvious implementation breaks in three w
 - With only a few replicas the canary percentages are coarse, because they count pods, not
   requests.
 - A public claim stays at 11 managed resources.
+
+---
+
+## ADR-009: A small demo app stands in for the example services
+
+**Status:** Accepted (Day 2)
+
+**Context.** The example claims pointed at images that don't exist yet. Pods that can't pull
+their image never become ready, and Argo Rollouts may keep updating the Rollout's status
+while it waits. That can make a check like "reconciling again leaves the Rollout's
+`resourceVersion` unchanged" fail for reasons that have nothing to do with the controller.
+The platform's pod contract is also strict enough that an arbitrary public image rarely
+meets all of it: `/healthz` and `/readyz` on the claim's port, `/metrics` for Prometheus, UID
+65532 and a read-only root filesystem.
+
+**Decision.** `demo/app` is a small Go HTTP server that meets exactly that contract. It
+exposes `http_requests_total` and `http_request_duration_seconds` (with a 0.25s bucket, to
+match the default latency threshold) so the SLO work has something to measure, and it
+excludes probe and scrape requests from both. `hack/demo-app.sh` builds it and loads it into
+k3d with `k3d image import`, so no registry is involved. Both example claims run it.
+
+**Consequences.**
+- The Day 2 checks run against pods that genuinely become ready.
+- The examples no longer show onboarding a real, unrelated service. That still has to be
+  done with the real images.
+- The image exists only inside the local cluster; recreating the cluster means running
+  `hack/demo-app.sh` again.

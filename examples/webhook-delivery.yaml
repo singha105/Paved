@@ -1,4 +1,5 @@
-# Placeholder values: owner, image and SLO numbers stand in until the service is built.
+# Owner and SLO values are placeholders. The image is the demo app (hack/demo-app.sh)
+# until the real service exists.
 apiVersion: platform.paved.dev/v1alpha1
 kind: ServiceClaim
 metadata:
@@ -6,7 +7,7 @@ metadata:
   namespace: platform-claims
 spec:
   owner: team-integrations
-  image: ghcr.io/singha105/webhook-delivery:0.1.0
+  image: paved-demo-app:0.1.0
   port: 8080
   tier: public
   sli:
