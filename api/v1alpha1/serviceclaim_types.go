@@ -29,6 +29,12 @@ const (
 	ConditionReady           = "Ready"
 )
 
+// SLI types a ServiceClaim can request.
+const (
+	SLIHTTPAvailability = "http-availability"
+	SLIHTTPLatency      = "http-latency"
+)
+
 // Tiers a ServiceClaim can request. Each tier maps to a fixed set of managed resources.
 const (
 	TierPublic   = "public"
