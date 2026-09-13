@@ -1,0 +1,26 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-platform-paved-dev-v1alpha1-serviceclaim
+  failurePolicy: Fail
+  name: vserviceclaim-v1alpha1.paved.dev
+  rules:
+  - apiGroups:
+    - platform.paved.dev
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - serviceclaims
+  sideEffects: None

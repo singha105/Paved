@@ -1,5 +1,7 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= paved-controller:dev
+# docker-build imports the image into this k3d cluster when it exists (DECISIONS.md, ADR-016).
+K3D_CLUSTER ?= paved
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -113,8 +115,8 @@ build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: run
-run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+run: manifests generate fmt vet ## Run a controller from your host, without the admission webhook (it needs the in-cluster certificate).
+	ENABLE_WEBHOOKS=false go run ./cmd/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
@@ -122,8 +124,12 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # Override BASE_IMAGE to build from another registry, e.g.
 # make docker-build IMG=<img> BASE_IMAGE=docker.io/library/golang:1.26
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
+docker-build: ## Build docker image with the manager, and import it into the k3d cluster $(K3D_CLUSTER) if that cluster exists.
 	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t ${IMG} .
+	@if command -v k3d >/dev/null 2>&1 && k3d cluster get $(K3D_CLUSTER) >/dev/null 2>&1; then \
+		echo "Importing ${IMG} into k3d cluster $(K3D_CLUSTER)"; \
+		k3d image import ${IMG} --cluster $(K3D_CLUSTER); \
+	fi
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

@@ -43,6 +43,7 @@ import (
 	"github.com/singha105/paved/internal/builders"
 	"github.com/singha105/paved/internal/controller"
 	"github.com/singha105/paved/internal/slo"
+	webhookv1alpha1 "github.com/singha105/paved/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -235,6 +236,13 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "serviceclaim")
 		os.Exit(1)
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupServiceClaimWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "ServiceClaim")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 
