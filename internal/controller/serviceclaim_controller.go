@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
+	rolloutsv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -53,10 +55,9 @@ const (
 	Finalizer = "paved.dev/finalizer"
 
 	// Condition reasons.
-	ReasonApplied        = "Applied"
-	ReasonApplyFailed    = "ApplyFailed"
-	ReasonInvalidSpec    = "InvalidSpec"
-	ReasonNotImplemented = "NotImplemented"
+	ReasonApplied     = "Applied"
+	ReasonApplyFailed = "ApplyFailed"
+	ReasonInvalidSpec = "InvalidSpec"
 
 	claimKind = "ServiceClaim"
 
@@ -91,8 +92,8 @@ type ServiceClaimReconciler struct {
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile applies every object a ServiceClaim's tier requires, reports any it had to put
-// back, reads the claim's error budget from Prometheus, and records all of it in the claim's
-// status. It requeues every minute to keep the budget current. A deleted claim is finalized
+// back, reads the claim's error budget from Prometheus, decides whether its deploys are frozen,
+// and records all of it in the claim's status. It requeues every minute to keep the budget current. A deleted claim is finalized
 // instead: its namespace is deleted, and the finalizer is released once the namespace is gone.
 func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -140,7 +141,8 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			Message:            "The SLO can't be evaluated until the spec is valid",
 			ObservedGeneration: claim.Generation,
 		}}
-		return ctrl.Result{}, r.applyStatus(ctx, &claim, invalid, 0, report)
+		return ctrl.Result{}, r.applyStatus(ctx, &claim, 0, report,
+			invalid, report.condition, freezeCondition(&claim, report), readyCondition(&claim, invalid, nil, nil))
 	}
 
 	wasInSync := inSyncAtGeneration(&claim)
@@ -166,12 +168,37 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if report.condition.Reason == ReasonPrometheusUnavailable {
 		log.Info("Could not evaluate SLO, failing open", "reason", report.condition.Message)
 	}
-
-	if err := r.applyStatus(ctx, &claim, synced, applied, report); err != nil {
-		return ctrl.Result{}, errors.Join(applyErr, err)
+	frozen := freezeCondition(&claim, report)
+	previous := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionDeploysFrozen)
+	if previous == nil || previous.Status != frozen.Status {
+		log.Info("Deploy freeze changed", "frozen", frozen.Status, "reason", frozen.Reason, "message", frozen.Message)
 	}
-	if applyErr != nil {
-		return ctrl.Result{}, applyErr
+
+	rollout := &rolloutsv1alpha1.Rollout{}
+	var rolloutErr error
+	if applyErr == nil {
+		// Read past the cache: the Rollout was just applied, and a cached copy from before the
+		// apply would still report the previous generation as healthy.
+		reader := client.Reader(r.Client)
+		if r.APIReader != nil {
+			reader = r.APIReader
+		}
+		key := types.NamespacedName{Namespace: builders.NamespaceName(&claim), Name: claim.Name}
+		if err := reader.Get(ctx, key, rollout); err != nil {
+			rolloutErr = fmt.Errorf("getting Rollout %s: %w", key, err)
+		}
+	}
+	ready := readyCondition(&claim, synced, rollout, rolloutErr)
+	if apierrors.IsNotFound(rolloutErr) {
+		// Only a cache that hasn't caught up with the apply can miss it; its watch requeues the claim.
+		rolloutErr = nil
+	}
+
+	if err := r.applyStatus(ctx, &claim, applied, report, synced, report.condition, frozen, ready); err != nil {
+		return ctrl.Result{}, errors.Join(applyErr, rolloutErr, err)
+	}
+	if err := errors.Join(applyErr, rolloutErr); err != nil {
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: sloRefreshInterval}, nil
 }
@@ -258,18 +285,12 @@ func (r *ServiceClaimReconciler) applyFinalizer(ctx context.Context, claim *plat
 // request is built from scratch rather than from the fetched claim, so it carries only
 // those fields; a field left out, such as an unknown error budget, is cleared.
 func (r *ServiceClaimReconciler) applyStatus(
-	ctx context.Context, claim *platformv1alpha1.ServiceClaim, synced metav1.Condition, managed int, report sloReport,
+	ctx context.Context, claim *platformv1alpha1.ServiceClaim, managed int, report sloReport, set ...metav1.Condition,
 ) error {
-	conditions := claim.Status.Conditions
-	meta.SetStatusCondition(&conditions, synced)
-	meta.SetStatusCondition(&conditions, report.condition)
-	meta.SetStatusCondition(&conditions, metav1.Condition{
-		Type:               platformv1alpha1.ConditionReady,
-		Status:             metav1.ConditionFalse,
-		Reason:             ReasonNotImplemented,
-		Message:            "The deploy freeze is not implemented yet",
-		ObservedGeneration: claim.Generation,
-	})
+	conditions := slices.Clone(claim.Status.Conditions)
+	for _, condition := range set {
+		meta.SetStatusCondition(&conditions, condition)
+	}
 
 	conds := make([]any, 0, len(conditions))
 	for i := range conditions {

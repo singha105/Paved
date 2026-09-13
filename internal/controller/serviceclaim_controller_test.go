@@ -18,9 +18,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
+	rolloutsv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -46,6 +49,7 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		claimName      = "test-claim"
 		claimNamespace = "default"
 		managedNS      = "svc-" + claimName
+		prometheusDown = "querying Prometheus: connection refused"
 	)
 
 	var (
@@ -133,17 +137,22 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		Expect(healthy.Status).To(Equal(metav1.ConditionTrue))
 		Expect(healthy.Reason).To(Equal(ReasonWithinBudget))
 
+		frozen := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionDeploysFrozen)
+		Expect(frozen).NotTo(BeNil())
+		Expect(frozen.Status).To(Equal(metav1.ConditionFalse))
+		Expect(frozen.Reason).To(Equal(ReasonWithinBudget))
+
 		ready := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionReady)
 		Expect(ready).NotTo(BeNil())
 		Expect(ready.Status).To(Equal(metav1.ConditionFalse))
-		Expect(ready.Reason).To(Equal(ReasonNotImplemented))
+		Expect(ready.Reason).To(Equal(ReasonRolloutProgressing), "envtest runs no Argo Rollouts controller")
 	})
 
 	It("clears the budget and reports Unknown when Prometheus is unreachable, without failing the reconcile", func() {
 		healthyQuerier := reconciler.Prometheus
 		reconciler.Prometheus = &fakeQuerier{
-			window: queryResult{err: fmt.Errorf("querying Prometheus: connection refused")},
-			hour:   queryResult{err: fmt.Errorf("querying Prometheus: connection refused")},
+			window: queryResult{err: errors.New(prometheusDown)},
+			hour:   queryResult{err: errors.New(prometheusDown)},
 		}
 		DeferCleanup(func() { reconciler.Prometheus = healthyQuerier })
 
@@ -197,6 +206,50 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		Expect(np.Spec.PolicyTypes).To(Equal([]networkingv1.PolicyType{networkingv1.PolicyTypeIngress}))
 		Expect(recorder.Events).To(Receive(Equal("Normal DriftCorrected Reverted changes to NetworkPolicy svc-test-claim/test-claim")))
 		Expect(recorder.Events).To(BeEmpty())
+	})
+
+	It("freezes deploys when the budget is used up, and unfreezes them only once 5% of it is back", func() {
+		healthyQuerier := reconciler.Prometheus
+		DeferCleanup(func() { reconciler.Prometheus = healthyQuerier })
+
+		// The 99.5 objective's budget is an error ratio of 0.005.
+		expectFrozen := func(window queryResult, status metav1.ConditionStatus, reason string) {
+			GinkgoHelper()
+			reconciler.Prometheus = &fakeQuerier{window: window, hour: queryResult{value: 0.0005}}
+			reconcileClaim()
+			frozen := meta.FindStatusCondition(getClaim().Status.Conditions, platformv1alpha1.ConditionDeploysFrozen)
+			Expect(frozen).NotTo(BeNil())
+			Expect(frozen.Status).To(Equal(status), frozen.Message)
+			Expect(frozen.Reason).To(Equal(reason), frozen.Message)
+		}
+
+		By("freezing when no budget is left")
+		expectFrozen(queryResult{value: 0.006}, metav1.ConditionTrue, ReasonBudgetExhausted)
+		By("staying frozen with 3% of it back")
+		expectFrozen(queryResult{value: 0.00485}, metav1.ConditionTrue, ReasonBudgetRecovering)
+		By("staying frozen while the budget can't be measured")
+		expectFrozen(queryResult{err: errors.New(prometheusDown)}, metav1.ConditionTrue, ReasonBudgetUnknown)
+		By("unfreezing with 6% back")
+		expectFrozen(queryResult{value: 0.0047}, metav1.ConditionFalse, ReasonWithinBudget)
+		By("staying unfrozen when it dips back to 3%")
+		expectFrozen(queryResult{value: 0.00485}, metav1.ConditionFalse, ReasonWithinBudget)
+		Expect(recorder.Events).To(BeEmpty())
+	})
+
+	It("reports Ready once Argo Rollouts reports the Rollout healthy at its generation", func() {
+		rollout := &rolloutsv1alpha1.Rollout{}
+		Expect(k8sClient.Get(ctx, managedKey, rollout)).To(Succeed())
+		rollout.Status.ObservedGeneration = strconv.FormatInt(rollout.Generation, 10)
+		rollout.Status.Phase = rolloutsv1alpha1.RolloutPhaseHealthy
+		Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+		reconcileClaim()
+
+		ready := meta.FindStatusCondition(getClaim().Status.Conditions, platformv1alpha1.ConditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Status).To(Equal(metav1.ConditionTrue), ready.Message)
+		Expect(ready.Reason).To(Equal(ReasonRolloutHealthy))
+		Expect(recorder.Events).To(BeEmpty(), "Argo Rollouts writing the Rollout's status is not drift")
 	})
 
 	It("applies a spec change without reporting it as drift", func() {

@@ -49,6 +49,10 @@ const (
 // sloReport is what one reconcile learned about a claim's SLO.
 type sloReport struct {
 	condition metav1.Condition
+	// measured is whether the error budget over the SLO window was read. remaining is then the
+	// share of it left, from 0 to 1.
+	measured  bool
+	remaining float64
 	// budgetRemaining and burnRate1h are formatted for status, or empty when unknown.
 	budgetRemaining string
 	burnRate1h      string
@@ -112,6 +116,8 @@ func evaluateSLO(ctx context.Context, prometheus slo.Querier, claim *platformv1a
 	if err != nil {
 		return setCondition(metav1.ConditionUnknown, ReasonUnusableData, err.Error())
 	}
+	report.measured = true
+	report.remaining = use.Remaining
 	report.budgetRemaining = slo.FormatPercent(use.Remaining)
 
 	burnRate := 0.0
