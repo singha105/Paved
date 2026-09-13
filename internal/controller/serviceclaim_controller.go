@@ -41,6 +41,7 @@ import (
 
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
 	"github.com/singha105/paved/internal/builders"
+	"github.com/singha105/paved/internal/slo"
 )
 
 const (
@@ -67,6 +68,9 @@ const (
 type ServiceClaimReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Prometheus answers the SLO queries. When it is nil or unreachable, SLOHealthy is Unknown
+	// and resources are still reconciled (DECISIONS.md, ADR-014).
+	Prometheus slo.Querier
 }
 
 // +kubebuilder:rbac:groups=platform.paved.dev,resources=serviceclaims,verbs=get;list;watch;create;update;patch;delete
@@ -79,9 +83,10 @@ type ServiceClaimReconciler struct {
 // +kubebuilder:rbac:groups=argoproj.io,resources=rollouts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors;prometheusrules,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile applies every object a ServiceClaim's tier requires and reports the result in
-// the claim's status. A deleted claim is finalized instead: its namespace is deleted, and the
-// finalizer is released once the namespace is gone.
+// Reconcile applies every object a ServiceClaim's tier requires, reads the claim's error
+// budget from Prometheus, and reports both in the claim's status. It requeues every minute
+// to keep the budget current. A deleted claim is finalized instead: its namespace is deleted,
+// and the finalizer is released once the namespace is gone.
 func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -121,7 +126,14 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			Message:            err.Error(),
 			ObservedGeneration: claim.Generation,
 		}
-		return ctrl.Result{}, r.applyStatus(ctx, &claim, invalid, 0)
+		report := sloReport{condition: metav1.Condition{
+			Type:               platformv1alpha1.ConditionSLOHealthy,
+			Status:             metav1.ConditionUnknown,
+			Reason:             ReasonInvalidSpec,
+			Message:            "The SLO can't be evaluated until the spec is valid",
+			ObservedGeneration: claim.Generation,
+		}}
+		return ctrl.Result{}, r.applyStatus(ctx, &claim, invalid, 0, report)
 	}
 	applied, applyErr := r.applyObjects(ctx, objects)
 
@@ -138,10 +150,18 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		synced.Message = fmt.Sprintf("Applied %d of %d managed resources: %v", applied, len(objects), applyErr)
 	}
 
-	if err := r.applyStatus(ctx, &claim, synced, applied); err != nil {
+	report := evaluateSLO(ctx, r.Prometheus, &claim)
+	if report.condition.Reason == ReasonPrometheusUnavailable {
+		log.Info("Could not evaluate SLO, failing open", "reason", report.condition.Message)
+	}
+
+	if err := r.applyStatus(ctx, &claim, synced, applied, report); err != nil {
 		return ctrl.Result{}, errors.Join(applyErr, err)
 	}
-	return ctrl.Result{}, applyErr
+	if applyErr != nil {
+		return ctrl.Result{}, applyErr
+	}
+	return ctrl.Result{RequeueAfter: sloRefreshInterval}, nil
 }
 
 // applyObjects server-side applies objects in order and stops at the first failure, because
@@ -214,17 +234,18 @@ func (r *ServiceClaimReconciler) applyFinalizer(ctx context.Context, claim *plat
 
 // applyStatus writes the status fields the controller owns with server-side apply. The
 // request is built from scratch rather than from the fetched claim, so it carries only
-// those fields.
+// those fields; a field left out, such as an unknown error budget, is cleared.
 func (r *ServiceClaimReconciler) applyStatus(
-	ctx context.Context, claim *platformv1alpha1.ServiceClaim, synced metav1.Condition, managed int,
+	ctx context.Context, claim *platformv1alpha1.ServiceClaim, synced metav1.Condition, managed int, report sloReport,
 ) error {
 	conditions := claim.Status.Conditions
 	meta.SetStatusCondition(&conditions, synced)
+	meta.SetStatusCondition(&conditions, report.condition)
 	meta.SetStatusCondition(&conditions, metav1.Condition{
 		Type:               platformv1alpha1.ConditionReady,
 		Status:             metav1.ConditionFalse,
 		Reason:             ReasonNotImplemented,
-		Message:            "SLO evaluation is not implemented yet",
+		Message:            "The deploy freeze is not implemented yet",
 		ObservedGeneration: claim.Generation,
 	})
 
@@ -244,6 +265,12 @@ func (r *ServiceClaimReconciler) applyStatus(
 	}
 	if managed > 0 {
 		status["managedResources"] = int64(managed)
+	}
+	if report.budgetRemaining != "" {
+		status["errorBudgetRemaining"] = report.budgetRemaining
+	}
+	if report.burnRate1h != "" {
+		status["burnRate1h"] = report.burnRate1h
 	}
 
 	u := &unstructured.Unstructured{Object: map[string]any{

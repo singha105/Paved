@@ -79,12 +79,21 @@ func (a BurnRateAlert) Threshold(budget *big.Rat) (string, error) {
 	return Decimal(new(big.Rat).Mul(burnRate, budget)), nil
 }
 
+// Rate returns the alert's burn rate as a number.
+func (a BurnRateAlert) Rate() (float64, error) {
+	rate, err := strconv.ParseFloat(a.BurnRate, 64)
+	if err != nil || rate <= 0 {
+		return 0, fmt.Errorf("burn rate %q is not a positive number", a.BurnRate)
+	}
+	return rate, nil
+}
+
 // BudgetLifetime returns how long a full error budget for window lasts when spent at the
 // alert's burn rate, rounded for people: "47 hours", "4.7 days".
 func (a BurnRateAlert) BudgetLifetime(window time.Duration) (string, error) {
-	burnRate, err := strconv.ParseFloat(a.BurnRate, 64)
-	if err != nil || burnRate <= 0 {
-		return "", fmt.Errorf("burn rate %q is not a positive number", a.BurnRate)
+	burnRate, err := a.Rate()
+	if err != nil {
+		return "", err
 	}
 	hours := window.Hours() / burnRate
 	if hours < 48 {

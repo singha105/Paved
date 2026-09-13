@@ -42,6 +42,7 @@ import (
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
 	"github.com/singha105/paved/internal/builders"
 	"github.com/singha105/paved/internal/controller"
+	"github.com/singha105/paved/internal/slo"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -89,6 +90,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var prometheusURL string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -109,6 +111,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&prometheusURL, "prometheus-url", slo.DefaultPrometheusURL,
+		"The address of the Prometheus server that SLI error ratios are read from.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -215,9 +219,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	prometheus, err := slo.NewPrometheusClient(prometheusURL)
+	if err != nil {
+		setupLog.Error(err, "Failed to create Prometheus client", "url", prometheusURL)
+		os.Exit(1)
+	}
+	setupLog.Info("Reading SLOs from Prometheus", "url", prometheusURL)
+
 	if err := (&controller.ServiceClaimReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Prometheus: prometheus,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "serviceclaim")
 		os.Exit(1)

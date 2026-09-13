@@ -346,3 +346,33 @@ neatly in a float.
 - Two claims with the same name in different namespaces would record series with the same
   `service` label. Claims are meant to live only in `platform-claims`, but nothing enforces that yet.
 - The error budget panel can look back only as far as Prometheus keeps data, 10 days by default.
+
+---
+
+## ADR-014: When Prometheus can't answer, the controller fails open
+
+**Status:** Accepted (Day 4)
+
+**Context.** Every minute the controller reads each claim's error budget from Prometheus, and
+the deploy freeze will use that budget to reject image changes. Prometheus can be restarting,
+overloaded, unreachable or slow, and a new service may have no data yet. If missing data
+counted as an exhausted budget, a monitoring outage would freeze deploys across the whole
+platform, at exactly the moment a team might need to ship a fix.
+
+**Decision.** Each query times out after 5 seconds. When Prometheus can't be queried, the claim's
+`SLOHealthy` condition is `Unknown` with reason `PrometheusUnavailable`, and
+`errorBudgetRemaining` and `burnRate1h` are cleared rather than left at their last values. A
+service with no requests in its window is `Unknown` with reason `NoTraffic`. Only a measured value
+can make `SLOHealthy` `False`: `BudgetExhausted` when nothing is left, or `FastBurn` when the 1h
+burn rate reaches 14.4, the fastest page alert's rate. Applying the claim's resources never waits
+on Prometheus: they are reconciled whether or not the SLO can be read.
+
+**Consequences.**
+- A Prometheus outage can't block anyone's deploys. It shows up as `Unknown` on every claim,
+  which is itself visible.
+- During an outage, a service that really is out of budget can still deploy. That is the accepted
+  cost: the burn-rate alerts are evaluated inside Prometheus and page once it recovers.
+- `kubectl get serviceclaims` shows an empty BUDGET column during an outage, not a stale number
+  that looks current.
+- Each reconcile makes at most two queries, and stops after the first if Prometheus fails, so an
+  outage costs one 5-second timeout per claim per minute.

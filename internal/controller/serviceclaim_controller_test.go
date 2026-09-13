@@ -80,7 +80,12 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 	}
 
 	BeforeAll(func() {
-		reconciler = &ServiceClaimReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		reconciler = &ServiceClaimReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			// Half the 28d budget spent, burning at 0.1x over the last hour.
+			Prometheus: &fakeQuerier{window: queryResult{value: 0.0025}, hour: queryResult{value: 0.0005}},
+		}
 		Expect(k8sClient.Create(ctx, &platformv1alpha1.ServiceClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: claimName, Namespace: claimNamespace},
 			Spec: platformv1alpha1.ServiceClaimSpec{
@@ -96,7 +101,8 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 	})
 
 	It("adds the finalizer, applies the internal tier's 11 resources and reports status", func() {
-		reconcileClaim()
+		result := reconcileClaim()
+		Expect(result.RequeueAfter).To(Equal(time.Minute), "the claim must requeue to keep its budget fresh")
 
 		claim := getClaim()
 		Expect(controllerutil.ContainsFinalizer(claim, Finalizer)).To(BeTrue())
@@ -110,13 +116,43 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		Expect(claim.Status.ObservedGeneration).To(Equal(claim.Generation))
 		Expect(claim.Status.LastReconcileTime).NotTo(BeNil())
 
+		Expect(claim.Status.ErrorBudgetRemaining).To(Equal("50.0%"))
+		Expect(claim.Status.BurnRate1h).To(Equal("0.10"))
+		healthy := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionSLOHealthy)
+		Expect(healthy).NotTo(BeNil())
+		Expect(healthy.Status).To(Equal(metav1.ConditionTrue))
+		Expect(healthy.Reason).To(Equal(ReasonWithinBudget))
+
 		ready := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionReady)
 		Expect(ready).NotTo(BeNil())
 		Expect(ready.Status).To(Equal(metav1.ConditionFalse))
 		Expect(ready.Reason).To(Equal(ReasonNotImplemented))
 	})
 
+	It("clears the budget and reports Unknown when Prometheus is unreachable, without failing the reconcile", func() {
+		healthyQuerier := reconciler.Prometheus
+		reconciler.Prometheus = &fakeQuerier{
+			window: queryResult{err: fmt.Errorf("querying Prometheus: connection refused")},
+			hour:   queryResult{err: fmt.Errorf("querying Prometheus: connection refused")},
+		}
+		DeferCleanup(func() { reconciler.Prometheus = healthyQuerier })
+
+		result := reconcileClaim()
+		Expect(result.RequeueAfter).To(Equal(time.Minute))
+
+		claim := getClaim()
+		Expect(claim.Status.ErrorBudgetRemaining).To(BeEmpty())
+		Expect(claim.Status.BurnRate1h).To(BeEmpty())
+		healthy := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionSLOHealthy)
+		Expect(healthy).NotTo(BeNil())
+		Expect(healthy.Status).To(Equal(metav1.ConditionUnknown))
+		Expect(healthy.Reason).To(Equal(ReasonPrometheusUnavailable))
+		synced := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionResourcesSynced)
+		Expect(synced.Status).To(Equal(metav1.ConditionTrue), "resources must still be reconciled")
+	})
+
 	It("leaves every resourceVersion unchanged when it reconciles again", func() {
+		reconcileClaim()
 		before := resourceVersions(getClaim())
 
 		reconcileClaim()
@@ -198,6 +234,9 @@ var _ = Describe("ServiceClaim Controller with a spec it cannot build", func() {
 		Expect(synced.Status).To(Equal(metav1.ConditionFalse))
 		Expect(synced.Reason).To(Equal(ReasonInvalidSpec))
 		Expect(synced.Message).To(ContainSubstring("latencyThreshold"))
+		healthy := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionSLOHealthy)
+		Expect(healthy).NotTo(BeNil())
+		Expect(healthy.Status).To(Equal(metav1.ConditionUnknown))
 
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: "svc-" + key.Name}, &corev1.Namespace{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "namespace was created for an invalid claim: %v", err)
