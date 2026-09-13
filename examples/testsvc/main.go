@@ -63,6 +63,16 @@ func run(addr string) error {
 			return fmt.Errorf("registering metrics: %w", err)
 		}
 	}
+	// Create every series the SLI reads at zero before serving. rate() can't see the increase
+	// that creates a series, so otherwise the first failures after each start would go uncounted.
+	for _, code := range []string{"200", "500"} {
+		if _, err := requests.GetMetricWithLabelValues(code, "get"); err != nil {
+			return fmt.Errorf("creating the code=%s request series: %w", code, err)
+		}
+		if _, err := latency.GetMetricWithLabelValues(code, "get"); err != nil {
+			return fmt.Errorf("creating the code=%s latency series: %w", code, err)
+		}
+	}
 
 	// Only application requests are counted: probes and scrapes would dilute the SLI.
 	instrument := func(handler http.HandlerFunc) http.Handler {

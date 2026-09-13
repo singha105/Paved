@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REGISTRY_PORT="${REGISTRY_PORT:-5001}"
-TAG="${TAG:-0.1.0}"
+TAG="${TAG:-0.1.1}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # One registry, two names: localhost from this machine, the container name from inside the cluster.

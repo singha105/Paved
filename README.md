@@ -11,7 +11,7 @@ metadata:
   namespace: platform-claims
 spec:
   owner: team-links
-  image: k3d-paved-registry:5001/testsvc:0.1.0
+  image: k3d-paved-registry:5001/testsvc:0.1.1
   port: 8080
   tier: public
   sli:
@@ -57,6 +57,10 @@ Serve Prometheus metrics at `/metrics` on the claim's `port`, including:
 - **`http_request_duration_seconds`**: a histogram of request latency in seconds. Claims using
   `http-latency` need it, with a bucket at exactly their `sli.latencyThreshold` (the default
   250ms needs a bucket at 0.25). A request is bad when it takes longer than the threshold.
+
+Create the series for every status code the service returns, successes and failures, at zero when
+it starts. Prometheus's `rate()` can't see the increase that creates a series, so without this the
+first failures after each start would not count against the SLO.
 
 Don't count health checks or scrapes in these metrics; they would make the service look
 healthier than it is. The platform also expects `/healthz` and `/readyz` on the same port, and
