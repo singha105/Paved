@@ -32,18 +32,23 @@ import (
 // objects inside it can be created on the same reconcile.
 //
 //	every tier:        Namespace, ServiceAccount, Rollout, NetworkPolicy, PrometheusRule,
-//	                   ServiceMonitor, dashboard ConfigMap
+//	                   ServiceMonitor, dashboard ConfigMap, runbook ConfigMap
 //	public, internal:  + Service, HorizontalPodAutoscaler, PodDisruptionBudget
 //	public:            + Ingress
 //
-// That is 11 objects for public, 10 for internal and 7 for batch. It returns an error when
-// the claim's SLI or SLO can't be turned into rules, such as an unparseable latencyThreshold.
+// That is 12 objects for public, 11 for internal and 8 for batch (DECISIONS.md, ADR-011). It
+// returns an error when the claim's SLI or SLO can't be turned into rules, such as an
+// unparseable latencyThreshold.
 func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
 	rule, err := BuildPrometheusRule(sc)
 	if err != nil {
 		return nil, err
 	}
 	dashboard, err := BuildDashboard(sc)
+	if err != nil {
+		return nil, err
+	}
+	runbook, err := BuildRunbook(sc)
 	if err != nil {
 		return nil, err
 	}
@@ -56,6 +61,7 @@ func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
 		rule,
 		BuildServiceMonitor(sc),
 		dashboard,
+		runbook,
 	}
 	if HasAutoscaling(sc) {
 		objects = append(objects, BuildService(sc), BuildHPA(sc), BuildPodDisruptionBudget(sc))

@@ -29,7 +29,7 @@ import (
 
 var baseKinds = []string{
 	"Namespace", "ServiceAccount", "Rollout", "NetworkPolicy",
-	"PrometheusRule", "ServiceMonitor", "ConfigMap",
+	"PrometheusRule", "ServiceMonitor", "ConfigMap", "ConfigMap",
 }
 
 // mustBuild returns Build's objects for sc, failing the test if Build returns an error.
@@ -47,9 +47,9 @@ func TestBuildResourceCountPerTier(t *testing.T) {
 		tier string
 		want int
 	}{
-		{platformv1alpha1.TierPublic, 11},
-		{platformv1alpha1.TierInternal, 10},
-		{platformv1alpha1.TierBatch, 7},
+		{platformv1alpha1.TierPublic, 12},
+		{platformv1alpha1.TierInternal, 11},
+		{platformv1alpha1.TierBatch, 8},
 	}
 	for _, tt := range tests {
 		t.Run(tt.tier, func(t *testing.T) {

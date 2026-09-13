@@ -69,6 +69,30 @@ func BurnRateAlerts() []BurnRateAlert {
 	return slices.Clone(burnRateAlerts)
 }
 
+// Threshold returns the error ratio above which the alert fires for a claim with the given
+// error budget: burnRate × budget, as an exact decimal.
+func (a BurnRateAlert) Threshold(budget *big.Rat) (string, error) {
+	burnRate, ok := new(big.Rat).SetString(a.BurnRate)
+	if !ok {
+		return "", fmt.Errorf("burn rate %q is not a number", a.BurnRate)
+	}
+	return Decimal(new(big.Rat).Mul(burnRate, budget)), nil
+}
+
+// BudgetLifetime returns how long a full error budget for window lasts when spent at the
+// alert's burn rate, rounded for people: "47 hours", "4.7 days".
+func (a BurnRateAlert) BudgetLifetime(window time.Duration) (string, error) {
+	burnRate, err := strconv.ParseFloat(a.BurnRate, 64)
+	if err != nil || burnRate <= 0 {
+		return "", fmt.Errorf("burn rate %q is not a positive number", a.BurnRate)
+	}
+	hours := window.Hours() / burnRate
+	if hours < 48 {
+		return strconv.FormatFloat(math.Round(hours), 'f', -1, 64) + " hours", nil
+	}
+	return strconv.FormatFloat(math.Round(hours/24*10)/10, 'f', -1, 64) + " days", nil
+}
+
 // AlertRules returns the four burn-rate alerts for sc. Each fires only while the error ratio
 // over both its long and its short window exceeds burnRate × (1 - objective). The long window
 // shows the burn is big enough to matter; the short one shows it is still happening, so an
@@ -86,11 +110,14 @@ func AlertRules(sc *platformv1alpha1.ServiceClaim, runbook string) ([]monitoring
 
 	rules := make([]monitoringv1.Rule, 0, len(burnRateAlerts))
 	for _, alert := range burnRateAlerts {
-		burnRate, ok := new(big.Rat).SetString(alert.BurnRate)
-		if !ok {
-			return nil, fmt.Errorf("burn rate %q is not a number", alert.BurnRate)
+		threshold, err := alert.Threshold(budget)
+		if err != nil {
+			return nil, err
 		}
-		threshold := Decimal(new(big.Rat).Mul(burnRate, budget))
+		lifetime, err := alert.BudgetLifetime(window)
+		if err != nil {
+			return nil, err
+		}
 
 		labels := RuleLabels(sc)
 		labels[LabelSeverity] = alert.Severity
@@ -109,7 +136,7 @@ func AlertRules(sc *platformv1alpha1.ServiceClaim, runbook string) ([]monitoring
 				"description": fmt.Sprintf("The error ratio is above %s over both the last %s and the last %s. "+
 					"At %sx, the %s error budget of %s lasts about %s.",
 					threshold, alert.LongWindow, alert.ShortWindow,
-					alert.BurnRate, sc.Spec.SLO.Window, Decimal(budget), budgetLifetime(window, burnRate)),
+					alert.BurnRate, sc.Spec.SLO.Window, Decimal(budget), lifetime),
 				"owner":       sc.Spec.Owner,
 				"runbook_url": RunbookURL,
 				"runbook":     runbook,
@@ -126,15 +153,4 @@ func SLOWindow(window string) (time.Duration, error) {
 		return 0, fmt.Errorf("SLO window %q is not a whole number of days such as 28d", window)
 	}
 	return time.Duration(days) * 24 * time.Hour, nil
-}
-
-// budgetLifetime is how long a full budget for window lasts when spent at burnRate, rounded
-// for people: "47 hours", "4.7 days".
-func budgetLifetime(window time.Duration, burnRate *big.Rat) string {
-	rate, _ := burnRate.Float64()
-	hours := window.Hours() / rate
-	if hours < 48 {
-		return strconv.FormatFloat(math.Round(hours), 'f', -1, 64) + " hours"
-	}
-	return strconv.FormatFloat(math.Round(hours/24*10)/10, 'f', -1, 64) + " days"
 }

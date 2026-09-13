@@ -260,3 +260,29 @@ k3d with `k3d image import`, so no registry is involved. Both example claims run
 - The controller cannot see an object of a managed kind that lacks the label. A pre-existing,
   unlabelled namespace called `svc-<name>` therefore looks absent to the finalizer, which
   releases the claim without deleting it.
+
+---
+
+## ADR-011: Every claim gets its own runbook, which grows the tiers to 12, 11 and 8 objects
+
+**Status:** Accepted (Day 3)
+
+**Context.** An engineer paged at night needs to learn quickly what the service is, who owns
+it, what this alert means for this service, and what to check first. Most of that is specific
+to the claim: the owner, the objective, the thresholds, how long the budget lasts. A single
+shared document can't hold it. Alert annotations conventionally carry a runbook URL, but a
+Kubernetes object has no URL.
+
+**Decision.** Each claim gets a ConfigMap `<claim>-runbook` holding a generated `runbook.md`:
+the service and its SLI and SLO, its owner, a table of the four alerts with this claim's
+thresholds and how long the budget lasts at each, and three first debugging steps. Every alert
+carries two annotations: `runbook_url`, which links to the general guidance in
+`docs/runbooks/slo-burn-rate.md` on GitHub, and `runbook`, which names the claim's ConfigMap.
+
+**Consequences.**
+- The runbook can't fall out of date with the alerts: both are generated from the same claim on
+  every reconcile, using the same threshold arithmetic.
+- The tier sets become 12 objects for public, 11 for internal and 8 for batch, one more than the
+  original table. The builder tests and the envtest suite assert the new counts.
+- Reading a service's own runbook takes a `kubectl` command; only the general guidance is a
+  clickable link.
