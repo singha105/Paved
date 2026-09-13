@@ -5,6 +5,7 @@
 | 1 | Cluster, scaffold, API, no-op reconcile | Done 2026-09-12 |
 | 2 | Reconcile loop and 11 managed resources | Done 2026-09-12 |
 | 3 | SLI recording rules, burn-rate alerts, dashboard | Done 2026-09-13 |
+| 4 | Error budget in status, drift correction | Done 2026-09-13 |
 
 ## BLOCKED
 
@@ -462,3 +463,118 @@ Extra checks beyond the acceptance list:
   dashboard errors; the Grafana API was not queried, because that needs the admin login.
 - Still open for the freeze work: unfreeze threshold (hysteresis), whether rollbacks are allowed
   during a freeze, and the webhook's failure policy.
+
+---
+
+## Day 4: burn-rate reads, error budget in status, drift correction
+
+Agreed with the user before building (2026-09-13):
+- `SLOHealthy` is `False` only when the budget is used up or the 1h burn rate reaches 14.4x, and
+  `Unknown` with no traffic or no Prometheus.
+- The budget is computed over the claim's SLO window, with Prometheus's default 10-day
+  retention stated rather than changed.
+- Status formats, Event wording and the restore-time method as proposed.
+
+### Acceptance
+
+Run on 2026-09-13 against the running cluster with both example claims in place. Output is copied
+from the terminal and shortened where marked.
+
+```text
+$ go test ./internal/slo/... -v
+(24 top-level tests pass; the budget math ones:)
+--- PASS: TestSpendBudget (0.00s)
+    --- PASS: TestSpendBudget/perfect_service (0.00s)
+    --- PASS: TestSpendBudget/exactly_at_the_objective (0.00s)
+    --- PASS: TestSpendBudget/half_the_budget_spent (0.00s)
+    --- PASS: TestSpendBudget/2x_over_the_objective (0.00s)
+    --- PASS: TestSpendBudget/every_request_failing (0.00s)
+    --- PASS: TestSpendBudget/a_tighter_objective_spends_faster (0.00s)
+    --- PASS: TestSpendBudget/rounding_below_zero_counts_as_zero (0.00s)
+--- PASS: TestSpendBudgetGuardsAgainstAZeroBudget (0.00s)
+--- PASS: TestSpendBudgetRejectsNonNumbers (0.00s)
+--- PASS: TestBurnRate (0.00s)
+ok  	github.com/singha105/paved/internal/slo	0.461s
+
+# First, the controller with its default in-cluster Prometheus URL, which doesn't resolve from this Mac
+$ kubectl get serviceclaims -A
+NAMESPACE         NAME               TIER     OWNER               BUDGET   FROZEN   READY   AGE
+platform-claims   url-shortener      public   team-links                            False   11h
+platform-claims   webhook-delivery   public   team-integrations                     False   11h
+ResourcesSynced=True (Applied): Applied 12 of 12 managed resources
+SLOHealthy=Unknown (PrometheusUnavailable): Could not read the 28d error ratio: querying Prometheus:
+  Post "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090/api/v1/query": dial tcp:
+  lookup kps-kube-prometheus-stack-prometheus.monitoring.svc: no such host
+
+# Then with --prometheus-url=http://localhost:9090 through a port-forward
+$ kubectl get serviceclaims -A
+NAMESPACE         NAME               TIER     OWNER               BUDGET   FROZEN   READY   AGE
+platform-claims   url-shortener      public   team-links          0.0%              False   11h
+platform-claims   webhook-delivery   public   team-integrations   100.0%            False   11h
+url-shortener: False (BudgetExhausted) The 28d error budget is used up: 119.27x of it spent
+webhook-delivery: True (WithinBudget) 100.0% of the 7d error budget left; no requests in the last hour
+
+# Drive errors at /boom on budget-demo, a fresh claim, with healthy traffic running throughout
+budget-demo, healthy traffic only:           100.0% (WithinBudget)
+after 40 requests to /boom, waited 4 min:    100.0% (WithinBudget)    <- not counted; see notes
+after 400 more requests to /boom:              0.0% (BudgetExhausted)
+  "The 28d error budget is used up: 1.63x of it spent"
+
+$ kubectl delete prometheusrule -n svc-url-shortener --all
+prometheusrule.monitoring.coreos.com "url-shortener" deleted from svc-url-shortener namespace
+$ sleep 5 && kubectl get prometheusrule -n svc-url-shortener
+NAME            AGE
+url-shortener   5s
+$ kubectl get events -n platform-claims --field-selector reason=DriftCorrected
+LAST SEEN   TYPE     REASON           OBJECT                       MESSAGE
+5s          Normal   DriftCorrected   serviceclaim/url-shortener   Recreated PrometheusRule svc-url-shortener/url-shortener
+```
+
+Extra checks beyond the acceptance list:
+
+- **Fail-open recorded no false drift.** The controller started against two claims already in
+  sync from Day 3 and recorded 0 `DriftCorrected` Events.
+- **Recording:** `demo/02-drift.cast` (asciinema 3.2.1, 100x30) shows the rule deleted, `kubectl wait`
+  succeeding, "Restored 72 ms after the delete returned", and the `DriftCorrected` Event.
+- **envtest:** it covers the 60-second requeue, the status values, fail-open with resources still in
+  sync, a recreated Service, a reverted NetworkPolicy edit, and a spec change recording no Event.
+- **Cleanup:** deleting `budget-demo` removed its namespace, and the claim was gone.
+- **Controller log:** 0 error lines across the Day 4 runs. **`make lint`:** 0 issues.
+
+### Measurements
+
+| What | Value | How measured |
+|---|---|---|
+| Restore time for a deleted PrometheusRule | min 65 ms, median 78 ms, max 99 ms over 5 runs (72 ms in the recording) | A watch on the rule, timing from `kubectl delete` returning to the watch's `ADDED` event |
+| Statement coverage | builders 90.2%, controller 86.6%, slo 93.0% | `make test` |
+
+### Deviations from the spec
+
+- **A temporary claim, `budget-demo`, showed the budget dropping.** `url-shortener`'s budget was
+  already 0.0% from Day 3's `/boom` test, and it will stay there until those errors age out of
+  Prometheus. `budget-demo` used the same test image, wasn't committed, and was deleted afterwards.
+
+- **Drift is caught by the label-mapped watches from Day 2 (ADR-006), not `Owns()`.** Owner
+  references can't cross from `svc-<claim>` to `platform-claims`.
+- **The objective-100 guard has two layers.** The CRD and `ErrorBudget` already reject 100, and
+  `SpendBudget` also returns an error for a zero budget rather than dividing by it.
+- **The controller runs through `go run ./cmd/main.go --prometheus-url=http://localhost:9090`.**
+  `make run` passes no flags, and the in-cluster default address doesn't resolve from this Mac.
+- **Events use the `events.k8s.io/v1` API**, because controller-runtime deprecates
+  `GetEventRecorderFor` in favour of `GetEventRecorder`.
+
+### Notes for later days
+
+- With 10 days of retention, a 28d or 30d budget counts only the last 10 days (ADR-014 and the
+  agreed decision above).
+- Drift detection makes one uncached GET per managed object per reconcile (ADR-015).
+- `SLOHealthy` doesn't feed `Ready` or a deploy freeze yet; that is the admission webhook's job.
+- **The first failures on a new series aren't counted.** `budget-demo`'s first 40 requests to `/boom`
+  created each pod's `code="500"` series. A range query shows the series first scraped already at
+  20 per pod, and `rate()` treats a series' first sample as its starting point, so those 40 errors
+  never reached the budget; the next 400 did. A real service has the same gap after every pod
+  start. The usual fix is for a service to create its error series at zero on startup (for example
+  `requests.WithLabelValues("500", "get")`). That would change `examples/testsvc` and the README's
+  service contract, so it is raised with the user rather than done here.
+- `kubectl get --watch-only --output-watch-events -o name` prints no event type, which is why the
+  first restore-time script never saw `ADDED`. The measurement uses the default table output.

@@ -87,6 +87,40 @@ From the claim's SLI and objective, the controller generates:
   percentiles and error budget remaining, plus a **runbook** ConfigMap. The alerts link to
   [docs/runbooks/slo-burn-rate.md](docs/runbooks/slo-burn-rate.md).
 
+## What the controller reports
+
+Every minute, the controller reads each claim's error ratio from Prometheus and records it in
+the claim's status:
+
+- **`errorBudgetRemaining`** (the BUDGET column): the share of the error budget left over the
+  SLO window, `clamp(1 - errorRatio / (1 - objective), 0, 1)`.
+- **`burnRate1h`**: how fast the last hour spent it. At 1, the whole budget would last exactly
+  the SLO window.
+- **`SLOHealthy`**: `True` while budget remains; `False` when it is used up
+  (`BudgetExhausted`) or the last hour burned at 14.4x or faster (`FastBurn`); `Unknown` when
+  there is no traffic or Prometheus can't be reached.
+
+```text
+$ kubectl get serviceclaims -A
+NAMESPACE         NAME               TIER     OWNER               BUDGET   FROZEN   READY   AGE
+platform-claims   url-shortener      public   team-links          0.0%              False   11h
+platform-claims   webhook-delivery   public   team-integrations   100.0%            False   11h
+```
+
+Here `url-shortener` has spent its whole budget: a load test sent it requests to `/boom`, which
+always fails.
+
+If Prometheus is unreachable, the controller fails open: `SLOHealthy` becomes `Unknown`, the
+budget is left blank rather than guessed, and resources are still reconciled
+([ADR-014](DECISIONS.md#adr-014-when-prometheus-cant-answer-the-controller-fails-open)).
+
+The controller also heals drift. Delete or edit an object it manages and the next reconcile puts
+it back, recording a `DriftCorrected` Event on the claim
+([ADR-015](DECISIONS.md#adr-015-drift-is-detected-from-the-controllers-own-field-ownership)).
+[`demo/02-drift.cast`](demo/02-drift.cast) records a deleted PrometheusRule coming back. In five
+measured runs on a local k3d cluster, the rule was back 65 to 99 ms after `kubectl delete`
+returned (median 78 ms).
+
 ## Run it locally
 
 Requires Docker, k3d, kubectl, Helm and Go. Versions used are pinned in [PROGRESS.md](PROGRESS.md).
@@ -95,7 +129,18 @@ Requires Docker, k3d, kubectl, Helm and Go. Versions used are pinned in [PROGRES
 ./hack/cluster-up.sh        # k3d cluster, registry on localhost:5001, platform stack
 ./hack/testsvc-image.sh     # build and push the test service
 make install                # install the ServiceClaim CRD
-make run                    # run the controller against the cluster
+```
+
+Outside the cluster, the controller can't reach Prometheus's in-cluster address. Forward it:
+
+```bash
+kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9090:9090
+```
+
+Then run the controller against the cluster, pointed at the forwarded port:
+
+```bash
+go run ./cmd/main.go --prometheus-url=http://localhost:9090
 ```
 
 In another terminal:
