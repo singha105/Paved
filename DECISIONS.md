@@ -312,3 +312,37 @@ builds the image and pushes it to `localhost:5001/testsvc:<tag>`; claims referen
 - The cluster had to be recreated once, from the script, to attach the registry.
 - One registry has two names: `localhost:5001` from the laptop, `k3d-paved-registry:5001` from pods.
 - Pushed images survive a cluster rebuild, as long as the registry container isn't deleted.
+
+---
+
+## ADR-013: Generated SLO rules must return data, not merely load
+
+**Status:** Accepted (Day 3)
+
+**Context.** A Prometheus rule that loads without errors but never returns a value looks
+healthy and protects nothing. The generated rules have to be right for every claim: a service
+that has never failed, a service with no traffic, and objectives whose arithmetic doesn't fit
+neatly in a float.
+
+**Decision.**
+- **Recording rules do the expensive work once.** For each window they compute the error ratio
+  from the raw counters, scoped by `namespace="svc-<claim>"`, and record it with only the
+  `service`, `owner` and `tier` labels. The four alerts read those recorded series.
+- **Availability uses `(bad requests or vector(0)) / all requests`.** Prometheus has no series
+  for failed requests until the first failure. Without `or vector(0)`, a service that has never
+  failed would record nothing instead of 0.
+- **Latency uses `1 - (requests in the threshold bucket / all requests)`**, with the bucket
+  label written the way Prometheus 3 stores it: a 1s threshold is `le="1.0"`, not `le="1"`
+  (checked against the running Prometheus).
+- **Thresholds are exact decimals.** Burn rate × budget is computed with rational arithmetic and
+  written as a literal: 14.4 × 0.005 is `0.072`, where float64 would give `0.07200000000000001`.
+- **Each alert needs both of its windows above the threshold, with no `for` clause.** All four
+  share the name `SLOErrorBudgetBurn`; the `severity`, `long_window` and `short_window` labels
+  tell them apart.
+
+**Consequences.**
+- A service with no traffic records no value, so its burn-rate alerts can't fire. Detecting a
+  service that should have traffic and doesn't would need a different kind of alert.
+- Two claims with the same name in different namespaces would record series with the same
+  `service` label. Claims are meant to live only in `platform-claims`, but nothing enforces that yet.
+- The error budget panel can look back only as far as Prometheus keeps data, 10 days by default.

@@ -1,135 +1,126 @@
 # paved
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+An internal developer platform built as a Kubernetes operator. A developer writes one short
+`ServiceClaim`; the controller turns it into a production-shaped service and keeps it that way.
 
-## Getting Started
-
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/paved:tag
+```yaml
+apiVersion: platform.paved.dev/v1alpha1
+kind: ServiceClaim
+metadata:
+  name: url-shortener
+  namespace: platform-claims
+spec:
+  owner: team-links
+  image: k3d-paved-registry:5001/testsvc:0.1.0
+  port: 8080
+  tier: public
+  sli:
+    type: http-availability
+  slo:
+    objective: "99.5"
+    window: 28d
+  scale:
+    min: 2
+    max: 5
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+The project is being built in stages. [PROGRESS.md](PROGRESS.md) records what works so far and
+the output that proves it; [DECISIONS.md](DECISIONS.md) explains the non-obvious choices.
 
-**Install the CRDs into the cluster:**
+## What a claim becomes
 
-```sh
-make install
+Each claim is reconciled into its own namespace, `svc-<name>`. The controller server-side
+applies every object on each reconcile, puts back anything deleted or edited, and deletes the
+namespace when the claim is deleted.
+
+| Object | public | internal | batch |
+|---|---|---|---|
+| Namespace, ServiceAccount, Argo Rollout (canary), NetworkPolicy | yes | yes | yes |
+| PrometheusRule: SLI recording rules and burn-rate alerts | yes | yes | yes |
+| ServiceMonitor, Grafana dashboard, runbook | yes | yes | yes |
+| Service, HorizontalPodAutoscaler, PodDisruptionBudget | yes | yes | no |
+| Ingress (`<name>.localhost` through Traefik) | yes | no | no |
+
+Developers cannot set resource limits, security context, rollout strategy, probes or canary
+steps. Those belong to the platform ([ADR-001](DECISIONS.md#adr-001-developers-cannot-set-limits-security-context-rollout-strategy-probes-or-canary-steps)).
+
+## Service contract
+
+The platform measures every service the same way, so every service must expose the same
+metrics. **This is the one thing a service must do to be onboarded.**
+
+Serve Prometheus metrics at `/metrics` on the claim's `port`, including:
+
+- **`http_requests_total`**: a counter of HTTP requests, with the status code in a label named
+  `code` (for example `code="500"`). Every claim needs it. For `http-availability`, a request
+  is bad when its code is not in the claim's `sli.goodStatuses`.
+- **`http_request_duration_seconds`**: a histogram of request latency in seconds. Claims using
+  `http-latency` need it, with a bucket at exactly their `sli.latencyThreshold` (the default
+  250ms needs a bucket at 0.25). A request is bad when it takes longer than the threshold.
+
+Don't count health checks or scrapes in these metrics; they would make the service look
+healthier than it is. The platform also expects `/healthz` and `/readyz` on the same port, and
+runs the container as UID 65532 with a read-only root filesystem.
+
+Go services get all of this from `prometheus/client_golang`'s `promhttp.InstrumentHandlerCounter`
+and `promhttp.InstrumentHandlerDuration`. [`examples/testsvc`](examples/testsvc/main.go) is a
+complete example.
+
+## How SLOs are enforced
+
+From the claim's SLI and objective, the controller generates:
+
+- **Recording rules** for the SLI error ratio over 5m, 30m, 1h, 2h, 6h, 1d and 3d, named
+  `sli:http_availability:error_ratio_rate5m` (or `sli:http_latency:...`) and labelled
+  `service`, `owner` and `tier`.
+- **Four burn-rate alerts** (`SLOErrorBudgetBurn`) from the Google SRE Workbook. Each fires only
+  when both of its windows are burning the error budget faster than its threshold:
+
+  | Severity | Burn rate | Long window | Short window |
+  |---|---|---|---|
+  | page | 14.4 | 1h | 5m |
+  | page | 6 | 6h | 30m |
+  | ticket | 3 | 1d | 2h |
+  | ticket | 1 | 3d | 6h |
+
+- **A Grafana dashboard** with request rate, error ratio against the objective, latency
+  percentiles and error budget remaining, plus a **runbook** ConfigMap. The alerts link to
+  [docs/runbooks/slo-burn-rate.md](docs/runbooks/slo-burn-rate.md).
+
+## Run it locally
+
+Requires Docker, k3d, kubectl, Helm and Go. Versions used are pinned in [PROGRESS.md](PROGRESS.md).
+
+```bash
+./hack/cluster-up.sh        # k3d cluster, registry on localhost:5001, platform stack
+./hack/testsvc-image.sh     # build and push the test service
+make install                # install the ServiceClaim CRD
+make run                    # run the controller against the cluster
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+In another terminal:
 
-```sh
-make deploy IMG=<some-registry>/paved:tag
+```bash
+kubectl apply -f examples/platform-claims-namespace.yaml
+kubectl apply -f examples/url-shortener.yaml
+kubectl get serviceclaims -n platform-claims
+curl http://url-shortener.localhost/boom    # returns 500; counts against the SLO
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+## Repository layout
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
 ```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
+api/v1alpha1/        ServiceClaim types
+cmd/main.go          controller manager
+internal/builders/   one pure function per managed object
+internal/slo/        error budgets, recording rules, burn-rate alerts
+internal/controller/ reconciler
+examples/            example claims and the test service
+docs/runbooks/       runbooks the alerts link to
+hack/                cluster bootstrap and image scripts
+test/                e2e suite and third-party CRDs for tests
 ```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/paved:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/paved/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
 
 ## License
 
-Copyright 2026 Arnab Singh.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache License 2.0.
