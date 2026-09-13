@@ -25,6 +25,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	rolloutsv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -61,12 +63,18 @@ var _ = BeforeSuite(func() {
 	var err error
 	err = platformv1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	Expect(rolloutsv1alpha1.AddToScheme(scheme.Scheme)).To(Succeed())
+	Expect(monitoringv1.AddToScheme(scheme.Scheme)).To(Succeed())
 
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "..", "config", "crd", "bases"),
+			// Third-party CRDs the controller writes to, from hack/update-test-crds.sh.
+			filepath.Join("..", "..", "test", "crds"),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 

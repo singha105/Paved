@@ -63,6 +63,11 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 
+		By("installing the third-party CRDs the controller watches")
+		cmd = exec.Command("kubectl", "apply", "--server-side", "-f", "test/crds")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install third-party CRDs")
+
 		By("installing CRDs")
 		cmd = exec.Command("make", "install")
 		_, err = utils.Run(cmd)
@@ -87,6 +92,10 @@ var _ = Describe("Manager", Ordered, func() {
 
 		By("uninstalling CRDs")
 		cmd = exec.Command("make", "uninstall")
+		_, _ = utils.Run(cmd)
+
+		By("uninstalling the third-party CRDs")
+		cmd = exec.Command("kubectl", "delete", "--ignore-not-found", "-f", "test/crds")
 		_, _ = utils.Run(cmd)
 
 		By("removing manager namespace")

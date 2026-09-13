@@ -25,10 +25,14 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	rolloutsv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -36,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
+	"github.com/singha105/paved/internal/builders"
 	"github.com/singha105/paved/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -45,11 +50,33 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
-func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
-	utilruntime.Must(platformv1alpha1.AddToScheme(scheme))
+// addToScheme registers every API type the manager reads or writes. Errors are returned
+// rather than panicking, so a failure is logged and the process exits cleanly.
+func addToScheme(s *runtime.Scheme) error {
+	for _, add := range []func(*runtime.Scheme) error{
+		clientgoscheme.AddToScheme,
+		platformv1alpha1.AddToScheme,
+		rolloutsv1alpha1.AddToScheme,
+		monitoringv1.AddToScheme,
+	} {
+		if err := add(s); err != nil {
+			return err
+		}
+	}
 	// +kubebuilder:scaffold:scheme
+	return nil
+}
+
+// managedObjectCache limits the manager's cache for every managed kind to objects the
+// platform created. Without it the controller would hold every Namespace, ConfigMap and
+// Service in the cluster in memory. ServiceClaims are cached unfiltered.
+func managedObjectCache() cache.Options {
+	managed := labels.SelectorFromSet(labels.Set{builders.LabelManagedBy: builders.ManagedBy})
+	byObject := make(map[client.Object]cache.ByObject)
+	for _, obj := range builders.ManagedTypes() {
+		byObject[obj] = cache.ByObject{Label: managed}
+	}
+	return cache.Options{ByObject: byObject}
 }
 
 // nolint:gocyclo
@@ -89,6 +116,11 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := addToScheme(scheme); err != nil {
+		setupLog.Error(err, "Failed to register API types")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -160,6 +192,7 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
+		Cache:                  managedObjectCache(),
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,

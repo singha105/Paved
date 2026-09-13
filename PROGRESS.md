@@ -3,6 +3,7 @@
 | Day | Goal | Status |
 |---|---|---|
 | 1 | Cluster, scaffold, API, no-op reconcile | Done 2026-09-12 |
+| 2 | Reconcile loop and 11 managed resources | Done 2026-09-12 |
 
 ## BLOCKED
 
@@ -28,7 +29,7 @@ for the rest of the build; change one only on purpose, and record why here.
 | controller-gen | v0.22.0 | `CONTROLLER_TOOLS_VERSION` in `Makefile`, installed to `bin/` |
 | kustomize | v5.8.1 | `KUSTOMIZE_VERSION` in `Makefile` |
 | setup-envtest | v0.25.0, serving Kubernetes 1.37.0 binaries | `make test` output |
-| golangci-lint | v2.13.1 | `GOLANGCI_LINT_VERSION` in `Makefile` (not downloaded yet) |
+| golangci-lint | v2.13.1 | `GOLANGCI_LINT_VERSION` in `Makefile`; built with the logcheck plugin into `bin/` on Day 2 |
 
 ### Go libraries (`go.mod`)
 
@@ -36,6 +37,13 @@ for the rest of the build; change one only on purpose, and record why here.
 |---|---|
 | sigs.k8s.io/controller-runtime | v0.25.0 |
 | k8s.io/api, k8s.io/apimachinery, k8s.io/client-go | v0.37.0 |
+| github.com/argoproj/argo-rollouts | v1.10.0 (Day 2; Rollout types, matching the installed controller) |
+| github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring | v0.93.1 (Day 2; API-only module, matching the installed operator) |
+| github.com/prometheus/client_golang | v1.24.0 (Day 2; demo app metrics, already a controller-runtime dependency) |
+
+Adding argo-rollouts raised the `go` directive in `go.mod` from 1.26.0 to 1.26.1, the minimum it
+declares. It pins `k8s.io/*` v0.34.5 in its own `go.mod`, but that doesn't apply to this module:
+the build resolves v0.37.0 and pulls in no `k8s.io/kubernetes` packages.
 
 ### Cluster
 
@@ -151,3 +159,139 @@ All taken on 2026-09-12 with the full stack installed and no ServiceClaims yet.
   contract, freeze/unfreeze thresholds, webhook rollback and failure policy, `scale.min > scale.max`,
   PDB shape, canary style, claim namespace and name rules, Ingress host and TLS, dashboard as a
   ConfigMap, `platform-system` naming and egress scope.
+
+---
+
+## Day 2: reconcile loop and 11 managed resources
+
+Agreed with the user before building: ownership through labels and a finalizer instead of owner
+references (ADR-006), a demo app image for the examples (ADR-009), a NetworkPolicy that admits
+Prometheus and leaves egress open (ADR-007), and the platform defaults listed in ADR-008.
+
+### Acceptance
+
+Run on 2026-09-12 against the live cluster, with the controller started by `make run`. Output is
+copied from the terminal; long lists are shortened where marked.
+
+```text
+$ kubectl apply -f examples/url-shortener.yaml
+serviceclaim.platform.paved.dev/url-shortener configured
+
+$ kubectl get all,networkpolicy,pdb,servicemonitor,prometheusrule,cm -n svc-url-shortener
+(pods and ReplicaSets created by the Rollout, plus:)
+service/url-shortener                               ClusterIP   10.43.70.20   80/TCP
+horizontalpodautoscaler.autoscaling/url-shortener   Rollout/url-shortener   MINPODS 2  MAXPODS 5
+networkpolicy.networking.k8s.io/url-shortener
+poddisruptionbudget.policy/url-shortener            MAX UNAVAILABLE 1
+servicemonitor.monitoring.coreos.com/url-shortener
+prometheusrule.monitoring.coreos.com/url-shortener
+configmap/kube-root-ca.crt                          (created by Kubernetes in every namespace)
+configmap/url-shortener-dashboard
+
+# Rollout, Ingress, ServiceAccount and the Namespace aren't in that listing, so select by label:
+$ kubectl get <all 11 kinds> -A -l paved.dev/claim=url-shortener
+Namespace                 <none>              svc-url-shortener
+ServiceAccount            svc-url-shortener   url-shortener
+Rollout                   svc-url-shortener   url-shortener
+NetworkPolicy             svc-url-shortener   url-shortener
+PrometheusRule            svc-url-shortener   url-shortener
+ServiceMonitor            svc-url-shortener   url-shortener
+ConfigMap                 svc-url-shortener   url-shortener-dashboard
+Service                   svc-url-shortener   url-shortener
+HorizontalPodAutoscaler   svc-url-shortener   url-shortener
+PodDisruptionBudget       svc-url-shortener   url-shortener
+Ingress                   svc-url-shortener   url-shortener
+COUNT=11
+
+# claim status once the Rollout was Healthy with 2/2 pods ready
+finalizers=["paved.dev/finalizer"] managedResources=11 observedGeneration=2
+ResourcesSynced=True (Applied): Applied 11 of 11 managed resources
+Ready=False (NotImplemented): SLO evaluation is not implemented yet
+
+$ kubectl get rollout -n svc-url-shortener -o jsonpath='{.items[0].metadata.resourceVersion}'
+5750
+$ kubectl annotate serviceclaim url-shortener -n platform-claims kick=1 --overwrite
+serviceclaim.platform.paved.dev/url-shortener annotated
+$ sleep 5
+$ kubectl get rollout -n svc-url-shortener -o jsonpath='{.items[0].metadata.resourceVersion}'
+5750
+reconciles logged during the check: 1
+RESULT: Rollout resourceVersion identical (5750)
+
+$ kubectl delete serviceclaim url-shortener -n platform-claims --wait=false
+serviceclaim.platform.paved.dev "url-shortener" deleted from platform-claims namespace
+$ kubectl get ns svc-url-shortener
+svc-url-shortener   Terminating   2m27s
+$ kubectl wait --for=delete serviceclaim/url-shortener -n platform-claims --timeout=180s
+serviceclaim.platform.paved.dev/url-shortener condition met
+$ kubectl get ns svc-url-shortener
+Error from server (NotFound): namespaces "svc-url-shortener" not found
+
+$ go test ./internal/builders/... -v
+21 tests and 26 subtests, all PASS
+ok  	github.com/singha105/paved/internal/builders	0.631s
+```
+
+Extra checks beyond the acceptance list:
+
+- **Nothing rewritten on the extra reconcile.** For all 11 objects, both `resourceVersion` and the
+  time `paved-controller` last wrote them were identical before and after the annotation.
+- **Drift repair:** `kubectl delete service url-shortener -n svc-url-shortener` was followed by
+  the controller recreating it (`kubectl wait --for=create` condition met).
+- **Ingress:** `GET http://url-shortener.localhost/` returned 200 through Traefik on port 80.
+- **Prometheus scrapes through the NetworkPolicy:** `up{namespace="svc-url-shortener"}` returned 2
+  targets, both `up=1`.
+- **Grafana:** the dashboard sidecar logged `Writing /tmp/dashboards/url-shortener.json`.
+- **Finalizer order:** the controller logged `Deleted namespace` at 20:09:00 and
+  `Removed finalizer after namespace was deleted` at 20:09:25, once the pods had terminated.
+- **Controller log:** zero errors for the whole run.
+- **envtest (`make test`):** create (finalizer, 10 internal-tier objects, status), a second reconcile
+  with every `resourceVersion` unchanged, repair of a deleted Service, and deletion that keeps the
+  finalizer until the namespace is gone. All pass.
+- **Demo image smoke test:** `docker run --read-only --user 65532:65532 --cap-drop ALL`; `/healthz`,
+  `/readyz` and `/` return 200, and `/metrics` counts only application requests.
+- **`make lint`:** 0 issues.
+
+### Measurements
+
+| What | Value | How measured |
+|---|---|---|
+| k3d node memory, stack plus `url-shortener` (2 pods) | 2.966 GiB of 4.801 GiB | `docker stats --no-stream` |
+| Demo app image | 24.7 MB (7.09 MB as stored in the k3d node) | `docker image ls`, `crictl images` |
+| Builder statement coverage | 100.0% | `make test` |
+| Controller statement coverage (envtest) | 82.0% | `make test` |
+
+### Deviations from the spec
+
+- **No owner references and no `Owns()`** (agreed; ADR-006). Every managed object carries the claim
+  labels, one watch per managed kind maps events back to the claim, and the finalizer deletes
+  `svc-<name>`. That adds one label beyond the spec's four: `paved.dev/claim-namespace`.
+- **The NetworkPolicy admits Prometheus and restricts ingress only** (agreed; ADR-007).
+- **The examples run `paved-demo-app:0.1.0`** (agreed; ADR-009).
+- **Platform defaults that section 3 left open** (agreed; ADR-008): 50m/64Mi requests, 250m/128Mi
+  limits, HPA on 70% CPU, PDB `maxUnavailable: 1`, Ingress host `<claim>.localhost` with no TLS,
+  dashboard as a ConfigMap, and a PrometheusRule with one empty group.
+- **`sleep 5` ran inside a background script**, because this shell tool blocks a foreground `sleep`.
+  The check around it is stricter than the spec's: it also compares every managed object's
+  `resourceVersion` and `paved-controller` write time.
+- **`cmd/main.go` no longer calls `utilruntime.Must`**. Scheme registration returns an error, which is
+  logged before exiting, per rule 5.
+- **The scaffold's e2e suite now installs `test/crds`** (Rollout, ServiceMonitor, PrometheusRule) before
+  deploying. Without them the manager can't start its watches in a fresh Kind cluster. This has not
+  run in CI yet, because Day 2 isn't pushed.
+
+### Notes for later days
+
+- When the new controller first started, it reconciled the stored Day 1 claim, whose image didn't
+  exist, before the updated example was applied. That left a failed first ReplicaSet, scaled to 0
+  once the demo image rolled out. The controller acts on whatever spec is stored, as it should.
+- Nothing validates yet that `svc-<claim>` fits the 63-character namespace limit (so claim names of
+  at most 59 characters), or that `spec.owner` is a valid label value. Either mistake would surface
+  as `ResourcesSynced=False (ApplyFailed)`.
+- Server-side apply with force adopts a pre-existing namespace called `svc-<name>`; the finalizer
+  only deletes it if its labels name this claim (ADR-010).
+- A batch claim's ServiceMonitor matches nothing, because batch has no Service.
+- Still open: freeze and unfreeze thresholds; the webhook's rollback handling and failure policy;
+  the app metrics contract (the demo app's `http_requests_total` and
+  `http_request_duration_seconds` are a proposal only); rules for claim namespaces and names; Ingress
+  TLS; and the `platform-system` namespace name.

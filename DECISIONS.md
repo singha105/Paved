@@ -227,3 +227,36 @@ k3d with `k3d image import`, so no registry is involved. Both example claims run
   done with the real images.
 - The image exists only inside the local cluster; recreating the cluster means running
   `hack/demo-app.sh` again.
+
+---
+
+## ADR-010: The controller's own writes never retrigger it, and it caches only platform objects
+
+**Status:** Accepted (Day 2)
+
+**Context.** Three details of the reconcile loop would each have caused trouble:
+- Every reconcile writes `status.lastReconcileTime`. With a plain watch on ServiceClaims, that
+  write is an update event, which queues the claim again, which writes a new time: a loop
+  that never goes idle.
+- Watching Namespaces, ConfigMaps and Services means caching them, and by default the cache
+  holds every object of those kinds in the cluster, including kube-prometheus-stack's large
+  dashboard ConfigMaps.
+- The builders return typed Go objects. Converted for server-side apply, they also carry a
+  null `creationTimestamp` and an empty `status`, which the controller would then own.
+
+**Decision.**
+- The ServiceClaim watch admits creation, deletion, and updates that change the generation,
+  labels or annotations. Status-only updates are dropped. Managed objects are watched without
+  a filter, so any change to them still queues their claim.
+- For every managed kind, the manager caches only objects labelled
+  `app.kubernetes.io/managed-by: paved`.
+- Before applying, the controller removes `metadata.creationTimestamp`, the pod template's
+  `creationTimestamp`, and `status` from the request.
+
+**Consequences.**
+- A reconcile that finds nothing to change leaves every managed object's `resourceVersion`
+  as it was. The envtest suite asserts this for all 10 internal-tier objects.
+- `kubectl annotate` on a claim triggers a reconcile; a status-only edit to a claim does not.
+- The controller cannot see an object of a managed kind that lacks the label. A pre-existing,
+  unlabelled namespace called `svc-<name>` therefore looks absent to the finalizer, which
+  releases the claim without deleting it.
