@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
 )
@@ -29,6 +30,16 @@ import (
 var baseKinds = []string{
 	"Namespace", "ServiceAccount", "Rollout", "NetworkPolicy",
 	"PrometheusRule", "ServiceMonitor", "ConfigMap",
+}
+
+// mustBuild returns Build's objects for sc, failing the test if Build returns an error.
+func mustBuild(t *testing.T, sc *platformv1alpha1.ServiceClaim) []client.Object {
+	t.Helper()
+	objects, err := Build(sc)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return objects
 }
 
 func TestBuildResourceCountPerTier(t *testing.T) {
@@ -42,7 +53,7 @@ func TestBuildResourceCountPerTier(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.tier, func(t *testing.T) {
-			if got := len(Build(newClaim(tt.tier))); got != tt.want {
+			if got := len(mustBuild(t, newClaim(tt.tier))); got != tt.want {
 				t.Errorf("Build() returned %d objects, want %d", got, tt.want)
 			}
 		})
@@ -63,7 +74,7 @@ func TestBuildKindsPerTier(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.tier, func(t *testing.T) {
 			var got []string
-			for _, obj := range Build(newClaim(tt.tier)) {
+			for _, obj := range mustBuild(t, newClaim(tt.tier)) {
 				got = append(got, obj.GetObjectKind().GroupVersionKind().Kind)
 			}
 			if !slices.Equal(got, tt.want) {
@@ -74,7 +85,7 @@ func TestBuildKindsPerTier(t *testing.T) {
 }
 
 func TestBuildBatchHasNoService(t *testing.T) {
-	for _, obj := range Build(newClaim(platformv1alpha1.TierBatch)) {
+	for _, obj := range mustBuild(t, newClaim(platformv1alpha1.TierBatch)) {
 		if _, isService := obj.(*corev1.Service); isService {
 			t.Fatalf("batch claim produced a Service: %s", obj.GetName())
 		}
@@ -85,7 +96,7 @@ func TestBuildObjectsAreLabelledAndPlaced(t *testing.T) {
 	for _, tier := range []string{platformv1alpha1.TierPublic, platformv1alpha1.TierInternal, platformv1alpha1.TierBatch} {
 		t.Run(tier, func(t *testing.T) {
 			sc := newClaim(tier)
-			objects := Build(sc)
+			objects := mustBuild(t, sc)
 
 			if _, isNamespace := objects[0].(*corev1.Namespace); !isNamespace {
 				t.Errorf("first object is %T, want the Namespace", objects[0])
@@ -116,6 +127,16 @@ func TestBuildObjectsAreLabelledAndPlaced(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsSLIsThatCannotBecomeRules(t *testing.T) {
+	sc := newClaim(platformv1alpha1.TierPublic)
+	sc.Spec.SLI.Type = platformv1alpha1.SLIHTTPLatency
+	sc.Spec.SLI.LatencyThreshold = "soon"
+
+	if objects, err := Build(sc); err == nil {
+		t.Errorf("Build() returned %d objects and no error for latencyThreshold %q", len(objects), "soon")
+	}
+}
+
 func TestManagedTypesMatchBuild(t *testing.T) {
 	types := ManagedTypes()
 	managed := make([]reflect.Type, 0, len(types))
@@ -123,13 +144,16 @@ func TestManagedTypesMatchBuild(t *testing.T) {
 		managed = append(managed, reflect.TypeOf(obj))
 	}
 
-	built := Build(newClaim(platformv1alpha1.TierPublic))
-	if len(built) != len(managed) {
-		t.Errorf("public Build() has %d objects but ManagedTypes() has %d types", len(built), len(managed))
-	}
-	for _, obj := range built {
+	seen := map[reflect.Type]bool{}
+	for _, obj := range mustBuild(t, newClaim(platformv1alpha1.TierPublic)) {
 		if !slices.Contains(managed, reflect.TypeOf(obj)) {
 			t.Errorf("Build() produces %T, which ManagedTypes() does not list", obj)
+		}
+		seen[reflect.TypeOf(obj)] = true
+	}
+	for _, typ := range managed {
+		if !seen[typ] {
+			t.Errorf("ManagedTypes() lists %v, which a public Build() never produces", typ)
 		}
 	}
 }

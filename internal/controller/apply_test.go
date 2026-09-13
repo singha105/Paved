@@ -31,6 +31,7 @@ import (
 const (
 	unitClaimName      = "url-shortener"
 	unitClaimNamespace = "platform-claims"
+	testObjective      = "99.5"
 )
 
 func unitTestClaim() *platformv1alpha1.ServiceClaim {
@@ -41,15 +42,22 @@ func unitTestClaim() *platformv1alpha1.ServiceClaim {
 			Image: "paved-demo-app:0.1.0",
 			Port:  8080,
 			Tier:  platformv1alpha1.TierPublic,
-			SLI:   platformv1alpha1.SLISpec{Type: "http-availability"},
-			SLO:   platformv1alpha1.SLOSpec{Objective: "99.5", Window: "28d"},
+			SLI: platformv1alpha1.SLISpec{
+				Type:         platformv1alpha1.SLIHTTPAvailability,
+				GoodStatuses: []int32{200, 201, 204, 301, 302, 304, 400, 404},
+			},
+			SLO:   platformv1alpha1.SLOSpec{Objective: testObjective, Window: "28d"},
 			Scale: platformv1alpha1.ScaleSpec{Min: 2, Max: 5},
 		},
 	}
 }
 
 func TestToApplyObjectSendsOnlyBuilderFields(t *testing.T) {
-	for _, obj := range builders.Build(unitTestClaim()) {
+	objects, err := builders.Build(unitTestClaim())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, obj := range objects {
 		u, err := toApplyObject(obj)
 		if err != nil {
 			t.Fatalf("toApplyObject(%T): %v", obj, err)

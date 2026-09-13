@@ -69,7 +69,9 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 	resourceVersions := func(claim *platformv1alpha1.ServiceClaim) map[string]string {
 		GinkgoHelper()
 		versions := map[string]string{}
-		for _, obj := range builders.Build(claim) {
+		objects, err := builders.Build(claim)
+		Expect(err).NotTo(HaveOccurred())
+		for _, obj := range objects {
 			id := fmt.Sprintf("%s %s", obj.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(obj))
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), obj)).To(Succeed(), "getting %s", id)
 			versions[id] = obj.GetResourceVersion()
@@ -87,7 +89,7 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 				Port:  8080,
 				Tier:  platformv1alpha1.TierInternal,
 				SLI:   platformv1alpha1.SLISpec{Type: "http-availability"},
-				SLO:   platformv1alpha1.SLOSpec{Objective: "99.5"},
+				SLO:   platformv1alpha1.SLOSpec{Objective: testObjective},
 				Scale: platformv1alpha1.ScaleSpec{Min: 1, Max: 3},
 			},
 		})).To(Succeed())
@@ -164,5 +166,45 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(reconcile.Result{}))
+	})
+})
+
+var _ = Describe("ServiceClaim Controller with a spec it cannot build", func() {
+	It("reports InvalidSpec and applies nothing", func() {
+		ctx := context.Background()
+		key := types.NamespacedName{Name: "bad-threshold", Namespace: "default"}
+		Expect(k8sClient.Create(ctx, &platformv1alpha1.ServiceClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
+			Spec: platformv1alpha1.ServiceClaimSpec{
+				Owner: "team-test",
+				Image: "registry.example.com/test:1.0.0",
+				Port:  8080,
+				Tier:  platformv1alpha1.TierInternal,
+				// Passes CRD validation, which doesn't check the duration format.
+				SLI:   platformv1alpha1.SLISpec{Type: platformv1alpha1.SLIHTTPLatency, LatencyThreshold: "soon"},
+				SLO:   platformv1alpha1.SLOSpec{Objective: testObjective},
+				Scale: platformv1alpha1.ScaleSpec{Min: 1, Max: 3},
+			},
+		})).To(Succeed())
+
+		reconciler := &ServiceClaimReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		claim := &platformv1alpha1.ServiceClaim{}
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		synced := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionResourcesSynced)
+		Expect(synced).NotTo(BeNil())
+		Expect(synced.Status).To(Equal(metav1.ConditionFalse))
+		Expect(synced.Reason).To(Equal(ReasonInvalidSpec))
+		Expect(synced.Message).To(ContainSubstring("latencyThreshold"))
+
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: "svc-" + key.Name}, &corev1.Namespace{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "namespace was created for an invalid claim: %v", err)
+
+		By("cleaning up: releasing the finalizer the reconcile added, then deleting the claim")
+		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
 	})
 })

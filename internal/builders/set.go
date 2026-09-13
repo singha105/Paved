@@ -36,16 +36,26 @@ import (
 //	public, internal:  + Service, HorizontalPodAutoscaler, PodDisruptionBudget
 //	public:            + Ingress
 //
-// That is 11 objects for public, 10 for internal and 7 for batch.
-func Build(sc *platformv1alpha1.ServiceClaim) []client.Object {
+// That is 11 objects for public, 10 for internal and 7 for batch. It returns an error when
+// the claim's SLI or SLO can't be turned into rules, such as an unparseable latencyThreshold.
+func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
+	rule, err := BuildPrometheusRule(sc)
+	if err != nil {
+		return nil, err
+	}
+	dashboard, err := BuildDashboard(sc)
+	if err != nil {
+		return nil, err
+	}
+
 	objects := []client.Object{
 		BuildNamespace(sc),
 		BuildServiceAccount(sc),
 		BuildRollout(sc),
 		BuildNetworkPolicy(sc),
-		BuildPrometheusRule(sc),
+		rule,
 		BuildServiceMonitor(sc),
-		BuildDashboard(sc),
+		dashboard,
 	}
 	if HasAutoscaling(sc) {
 		objects = append(objects, BuildService(sc), BuildHPA(sc), BuildPodDisruptionBudget(sc))
@@ -53,7 +63,7 @@ func Build(sc *platformv1alpha1.ServiceClaim) []client.Object {
 	if sc.Spec.Tier == platformv1alpha1.TierPublic {
 		objects = append(objects, BuildIngress(sc))
 	}
-	return objects
+	return objects, nil
 }
 
 // ManagedTypes returns an empty object of every kind Build can produce. The controller

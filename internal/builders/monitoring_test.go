@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
+	"github.com/singha105/paved/internal/slo"
 )
 
 func TestBuildServiceMonitor(t *testing.T) {
@@ -42,40 +43,122 @@ func TestBuildServiceMonitor(t *testing.T) {
 }
 
 func TestBuildPrometheusRule(t *testing.T) {
-	rule := BuildPrometheusRule(newClaim(platformv1alpha1.TierInternal))
-
-	if len(rule.Spec.Groups) != 1 || rule.Spec.Groups[0].Name != "url-shortener.slo" {
-		t.Fatalf("groups = %+v, want one group named url-shortener.slo", rule.Spec.Groups)
+	rule, err := BuildPrometheusRule(newClaim(platformv1alpha1.TierInternal))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(rule.Spec.Groups[0].Rules) != 0 {
-		t.Errorf("rules = %+v, want none until the SLO rules exist", rule.Spec.Groups[0].Rules)
+
+	groups := rule.Spec.Groups
+	if len(groups) != 2 || groups[0].Name != "url-shortener.sli" || groups[1].Name != "url-shortener.slo-alerts" {
+		t.Fatalf("groups = %+v, want url-shortener.sli then url-shortener.slo-alerts", groups)
+	}
+	if len(groups[0].Rules) != len(slo.Windows()) {
+		t.Errorf("SLI group has %d rules, want one per window (%d)", len(groups[0].Rules), len(slo.Windows()))
+	}
+	for _, r := range groups[0].Rules {
+		if !strings.HasPrefix(r.Record, "sli:http_availability:error_ratio_rate") {
+			t.Errorf("SLI group rule %+v is not an availability recording rule", r)
+		}
+	}
+	if len(groups[1].Rules) != 4 {
+		t.Fatalf("alert group has %d rules, want 4", len(groups[1].Rules))
+	}
+	for _, r := range groups[1].Rules {
+		if r.Alert != slo.AlertName || r.Annotations["runbook"] != "svc-url-shortener/url-shortener-runbook" {
+			t.Errorf("alert %q runbook annotation = %q, want the claim's runbook ConfigMap",
+				r.Alert, r.Annotations["runbook"])
+		}
 	}
 }
 
-func TestBuildDashboard(t *testing.T) {
-	sc := newClaim(platformv1alpha1.TierBatch)
-	cm := BuildDashboard(sc)
+func TestBuildPrometheusRuleRejectsInvalidSLI(t *testing.T) {
+	sc := newClaim(platformv1alpha1.TierPublic)
+	sc.Spec.SLI.GoodStatuses = nil
+	if _, err := BuildPrometheusRule(sc); err == nil {
+		t.Error("BuildPrometheusRule returned no error for an empty goodStatuses")
+	}
+}
 
+// dashboardPanels decodes the dashboard a claim produces.
+func dashboardPanels(t *testing.T, sc *platformv1alpha1.ServiceClaim) grafanaDashboard {
+	t.Helper()
+	cm, err := BuildDashboard(sc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cm.Labels[DashboardLabel] != "1" {
 		t.Errorf("label %s = %q, want \"1\" so Grafana loads it", DashboardLabel, cm.Labels[DashboardLabel])
 	}
-	raw, ok := cm.Data["url-shortener.json"]
+	raw, ok := cm.Data[sc.Name+".json"]
 	if !ok {
-		t.Fatalf("data keys = %v, want url-shortener.json", slicesOfKeys(cm.Data))
+		t.Fatalf("dashboard ConfigMap has no %s.json key", sc.Name)
+	}
+	var model grafanaDashboard
+	if err := json.Unmarshal([]byte(raw), &model); err != nil {
+		t.Fatalf("dashboard is not valid JSON: %v", err)
+	}
+	return model
+}
+
+func TestBuildDashboard(t *testing.T) {
+	sc := newClaim(platformv1alpha1.TierPublic)
+	model := dashboardPanels(t, sc)
+
+	if model.UID != DashboardUID(sc) || model.Title != testClaimName {
+		t.Errorf("uid %q title %q, want %q %q", model.UID, model.Title, DashboardUID(sc), testClaimName)
+	}
+	titles := make([]string, 0, len(model.Panels))
+	for _, p := range model.Panels {
+		titles = append(titles, p.Title)
+		if p.Datasource.UID != "prometheus" {
+			t.Errorf("panel %q datasource uid = %q, want prometheus", p.Title, p.Datasource.UID)
+		}
+	}
+	wantTitles := []string{PanelRequestRate, PanelErrorRatio, PanelLatency, PanelBudgetLeft}
+	if strings.Join(titles, "|") != strings.Join(wantTitles, "|") {
+		t.Fatalf("panels = %v, want %v", titles, wantTitles)
 	}
 
-	var model struct {
-		UID   string `json:"uid"`
-		Title string `json:"title"`
+	exprs := func(i int) string {
+		all := make([]string, 0, len(model.Panels[i].Targets))
+		for _, target := range model.Panels[i].Targets {
+			all = append(all, target.Expr)
+		}
+		return strings.Join(all, "\n")
 	}
-	if err := json.Unmarshal([]byte(raw), &model); err != nil {
-		t.Fatalf("dashboard is not valid JSON: %v\n%s", err, raw)
+	checks := []struct {
+		panel int
+		want  string
+	}{
+		{0, `sum by (code) (rate(http_requests_total{namespace="svc-url-shortener"}[$__rate_interval]))`},
+		{1, `sli:http_availability:error_ratio_rate5m{service="url-shortener"}`},
+		{1, `sli:http_availability:error_ratio_rate1h{service="url-shortener"}`},
+		{1, "vector(0.005)"},
+		{2, "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket"},
+		{3, `code!~"200|201|204|301|302|304|400|404"}[28d]`},
+		{3, "/ 0.005)"},
 	}
-	if model.Title != testClaimName {
-		t.Errorf("title = %q, want %q", model.Title, testClaimName)
+	for _, c := range checks {
+		if !strings.Contains(exprs(c.panel), c.want) {
+			t.Errorf("panel %q is missing %q; queries:\n%s", model.Panels[c.panel].Title, c.want, exprs(c.panel))
+		}
 	}
-	if model.UID != DashboardUID(sc) || len(model.UID) > 40 || !strings.HasPrefix(model.UID, "paved-") {
-		t.Errorf("uid = %q, want DashboardUID() (%q), at most 40 characters", model.UID, DashboardUID(sc))
+}
+
+func TestBuildDashboardShowsTheLatencyThreshold(t *testing.T) {
+	sc := newClaim(platformv1alpha1.TierInternal)
+	sc.Spec.SLI.Type = platformv1alpha1.SLIHTTPLatency
+	model := dashboardPanels(t, sc)
+
+	latency := make([]string, 0, len(model.Panels[2].Targets))
+	for _, target := range model.Panels[2].Targets {
+		latency = append(latency, target.Expr)
+	}
+	if !strings.Contains(strings.Join(latency, "\n"), "vector(0.25)") {
+		t.Errorf("latency panel queries = %v, want a 0.25s threshold line", latency)
+	}
+	if !strings.Contains(model.Panels[1].Targets[0].Expr, "sli:http_latency:error_ratio_rate5m") {
+		t.Errorf("error ratio panel reads %q, want the latency SLI", model.Panels[1].Targets[0].Expr)
 	}
 }
 
@@ -95,12 +178,4 @@ func TestDashboardUID(t *testing.T) {
 	if DashboardUID(a) == DashboardUID(elsewhere) {
 		t.Error("claims with the same name in different namespaces share a dashboard UID")
 	}
-}
-
-func slicesOfKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }

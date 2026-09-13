@@ -56,6 +56,11 @@ func NamespaceName(sc *platformv1alpha1.ServiceClaim) string {
 	return namespacePrefix + sc.Name
 }
 
+// RunbookName is the name of the ConfigMap that holds a claim's runbook.
+func RunbookName(sc *platformv1alpha1.ServiceClaim) string {
+	return sc.Name + "-runbook"
+}
+
 // Labels returns the labels every object managed for sc carries.
 func Labels(sc *platformv1alpha1.ServiceClaim) map[string]string {
 	return map[string]string{

@@ -53,6 +53,7 @@ const (
 	// Condition reasons.
 	ReasonApplied        = "Applied"
 	ReasonApplyFailed    = "ApplyFailed"
+	ReasonInvalidSpec    = "InvalidSpec"
 	ReasonNotImplemented = "NotImplemented"
 
 	claimKind = "ServiceClaim"
@@ -108,7 +109,20 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// The logger from controller-runtime already carries the claim's name and namespace.
 	log.Info("Reconciling ServiceClaim", "tier", claim.Spec.Tier, "generation", claim.Generation)
 
-	objects := builders.Build(&claim)
+	objects, err := builders.Build(&claim)
+	if err != nil {
+		// The spec passed API validation but can't become resources, for example an
+		// unparseable latencyThreshold. Retrying won't help until the claim changes.
+		log.Info("ServiceClaim spec cannot be built", "reason", err.Error())
+		invalid := metav1.Condition{
+			Type:               platformv1alpha1.ConditionResourcesSynced,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonInvalidSpec,
+			Message:            err.Error(),
+			ObservedGeneration: claim.Generation,
+		}
+		return ctrl.Result{}, r.applyStatus(ctx, &claim, invalid, 0)
+	}
 	applied, applyErr := r.applyObjects(ctx, objects)
 
 	synced := metav1.Condition{

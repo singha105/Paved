@@ -17,20 +17,39 @@ limitations under the License.
 package builders
 
 import (
+	"fmt"
+
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
+	"github.com/singha105/paved/internal/slo"
 )
 
-// SLORuleGroupName is the name of the rule group holding a claim's SLO rules.
-func SLORuleGroupName(sc *platformv1alpha1.ServiceClaim) string {
-	return sc.Name + ".slo"
+// SLIRuleGroupName is the rule group holding a claim's SLI recording rules.
+func SLIRuleGroupName(sc *platformv1alpha1.ServiceClaim) string {
+	return sc.Name + ".sli"
 }
 
-// BuildPrometheusRule returns the claim's alerting rules. For now it holds one empty group;
-// the SLO burn-rate rules arrive with the SLO work.
-func BuildPrometheusRule(sc *platformv1alpha1.ServiceClaim) *monitoringv1.PrometheusRule {
+// AlertRuleGroupName is the rule group holding a claim's burn-rate alerts.
+func AlertRuleGroupName(sc *platformv1alpha1.ServiceClaim) string {
+	return sc.Name + ".slo-alerts"
+}
+
+// BuildPrometheusRule returns the claim's SLO rules in two groups: recording rules for the
+// SLI error ratio over each window, and the burn-rate alerts that compare them against the
+// objective (see internal/slo).
+func BuildPrometheusRule(sc *platformv1alpha1.ServiceClaim) (*monitoringv1.PrometheusRule, error) {
+	namespace := NamespaceName(sc)
+	records, err := slo.RecordingRules(sc, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("building SLI recording rules: %w", err)
+	}
+	alerts, err := slo.AlertRules(sc, namespace+"/"+RunbookName(sc))
+	if err != nil {
+		return nil, fmt.Errorf("building burn-rate alerts: %w", err)
+	}
+
 	return &monitoringv1.PrometheusRule{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: monitoringv1.SchemeGroupVersion.String(),
@@ -38,7 +57,10 @@ func BuildPrometheusRule(sc *platformv1alpha1.ServiceClaim) *monitoringv1.Promet
 		},
 		ObjectMeta: objectMeta(sc, sc.Name),
 		Spec: monitoringv1.PrometheusRuleSpec{
-			Groups: []monitoringv1.RuleGroup{{Name: SLORuleGroupName(sc)}},
+			Groups: []monitoringv1.RuleGroup{
+				{Name: SLIRuleGroupName(sc), Rules: records},
+				{Name: AlertRuleGroupName(sc), Rules: alerts},
+			},
 		},
-	}
+	}, nil
 }

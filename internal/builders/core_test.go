@@ -44,7 +44,11 @@ func newClaim(tier string) *platformv1alpha1.ServiceClaim {
 			Image: "paved-demo-app:0.1.0",
 			Port:  8080,
 			Tier:  tier,
-			SLI:   platformv1alpha1.SLISpec{Type: "http-availability"},
+			SLI: platformv1alpha1.SLISpec{
+				Type:             platformv1alpha1.SLIHTTPAvailability,
+				GoodStatuses:     []int32{200, 201, 204, 301, 302, 304, 400, 404},
+				LatencyThreshold: "250ms",
+			},
 			SLO:   platformv1alpha1.SLOSpec{Objective: "99.5", Window: "28d"},
 			Scale: platformv1alpha1.ScaleSpec{Min: 1, Max: 4},
 		},
