@@ -26,16 +26,20 @@ import (
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
 )
 
-const testNamespace = "svc-url-shortener"
+const (
+	testClaimName = "url-shortener"
+	testOwner     = "team-links"
+	testNamespace = "svc-url-shortener"
+)
 
 var defaultGoodStatuses = []int32{200, 201, 204, 301, 302, 304, 400, 404}
 
 // newClaim returns a claim with the given SLI, with the defaults the API server fills in.
 func newClaim(sliType string) *platformv1alpha1.ServiceClaim {
 	return &platformv1alpha1.ServiceClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "url-shortener", Namespace: "platform-claims"},
+		ObjectMeta: metav1.ObjectMeta{Name: testClaimName, Namespace: "platform-claims"},
 		Spec: platformv1alpha1.ServiceClaimSpec{
-			Owner: "team-links",
+			Owner: testOwner,
 			Image: "testsvc:0.1.0",
 			Port:  8080,
 			Tier:  platformv1alpha1.TierPublic,
@@ -72,7 +76,7 @@ func TestRecordingRules(t *testing.T) {
 			if len(rules) != len(wantWindows) {
 				t.Fatalf("got %d rules, want one per window %v", len(rules), wantWindows)
 			}
-			wantLabels := map[string]string{"service": "url-shortener", "owner": "team-links", "tier": "public"}
+			wantLabels := map[string]string{"service": testClaimName, "owner": testOwner, "tier": "public"}
 			for i, rule := range rules {
 				window := wantWindows[i]
 				if rule.Record != RecordName(sliType, window) {
