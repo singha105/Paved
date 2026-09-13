@@ -407,3 +407,137 @@ resources and applying a spec edit never count.
   `Recreated PrometheusRule svc-url-shortener/url-shortener`.
 - Every reconcile makes one uncached GET per managed object: 12 per public claim, at least once
   a minute.
+
+---
+
+## ADR-016: The controller runs in the cluster, and `make docker-build` loads it into k3d
+
+**Status:** Accepted (Day 5)
+
+**Context.** The API server calls the admission webhook over TLS, at the webhook Service, with a
+certificate it trusts. cert-manager issues that certificate for the Service inside the cluster,
+so the webhook, and the controller in the same binary, have to run there. A controller started on
+the Mac can reconcile claims but can't answer admission requests. The scaffold's default image,
+`controller:latest`, can't work on k3d either: nothing pushes it anywhere, and a `latest` tag makes
+the kubelet try to pull it every time.
+
+**Decision.** `IMG` defaults to `paved-controller:dev`. `make docker-build` builds it and, when a k3d
+cluster named `paved` exists, imports it with `k3d image import`. The tag isn't `latest`, so the
+kubelet uses the imported image instead of pulling. `make deploy` applies `config/default` with its
+`[WEBHOOK]` and `[CERTMANAGER]` sections enabled. `make run` sets `ENABLE_WEBHOOKS=false`, because
+there is no certificate outside the cluster.
+
+**Consequences.**
+- `make docker-build deploy` works as written. On machines without k3d, such as CI's Kind cluster,
+  the import step is skipped.
+- Rebuilding under the same tag doesn't restart the running pod:
+  `kubectl rollout restart deployment/paved-controller-manager -n paved-system` picks up the new image.
+- A controller run from the Mac doesn't enforce deploy freezes.
+- The scaffold's metrics certificate is left out of `config/certmanager`, since the
+  `[METRICS-WITH-CERTS]` patch that would use it is not enabled.
+
+---
+
+## ADR-017: Deploys freeze when the budget is gone and unfreeze only at 5%
+
+**Status:** Accepted (Day 5)
+
+**Context.** The controller re-reads each claim's error budget every minute. A single threshold at
+zero would flap: a service near zero crosses it with every good or bad minute, each unfrozen minute
+lets a deploy through, and whether `kubectl apply` succeeds would depend on which minute it ran in.
+The budget also can't always be read: Prometheus can be down, or a service can have no traffic.
+
+**Decision.** `DeploysFrozen` becomes `True` (`BudgetExhausted`) when no budget is left, and stays
+`True` (`BudgetRecovering`) until at least 5% is back; then it is `False` (`WithinBudget`). When the
+budget can't be measured, the condition keeps its status, with reason `BudgetUnknown`. A fast burn
+alone does not freeze deploys: only a used-up budget does.
+
+**Consequences.**
+- A service must earn 5% of its budget back before it can ship again, so the freeze can't lift and
+  drop again within minutes.
+- A Prometheus outage never freezes a healthy service (ADR-014) and never unfreezes an exhausted one.
+  If a freeze outlives the data behind it, break-glass (ADR-018) is the way out.
+- Freeze decisions see only Prometheus's 10 days of retention, as budgets do (ADR-014).
+
+---
+
+## ADR-018: The webhook rejects only image changes, and break-glass must be set in the same update
+
+**Status:** Accepted (Day 5)
+
+**Context.** The freeze exists to stop shipping new code to a service that is out of budget, not to
+lock its claim. An emergency change still has to be possible, and it has to leave a record. But an
+override annotation left on a claim mustn't switch the freeze off for every later deploy.
+
+**Decision.**
+- The webhook rejects an update that changes `spec.image` while the stored claim's `DeploysFrozen`
+  is `True`. Every other change is admitted. A rollback is an image change too, so it needs
+  break-glass during a freeze.
+- `paved.dev/break-glass: "<reason>"` lets the change through only when the same update adds the
+  annotation or changes its value. A blank reason counts as none.
+- A break-glass change is admitted with a warning and recorded as a `Warning` `BreakGlassUsed`
+  Event on the claim, reported by `paved-webhook`, carrying the requesting user and the reason. Dry
+  runs record nothing, which is what `sideEffects: NoneOnDryRun` promises the API server.
+- The rejection is one line: `deploys frozen: url-shortener has 0% error budget remaining in a 28d
+  window (burn rate 14.2x). Override with annotation paved.dev/break-glass="<reason>" — this is
+  audited.` The numbers come from the claim's status, and read `unknown` when it has none.
+- `failurePolicy: Fail`.
+
+**Consequences.**
+- While the webhook can't answer, no ServiceClaim can be created or updated, including the
+  finalizer the controller adds to a new claim. Status writes are not affected. With the controller
+  scaled to zero, `kubectl annotate` on a claim failed with `failed calling webhook`.
+- The webhook trusts `DeploysFrozen` as the controller last wrote it. If the controller is down, a
+  freeze stays in force until it comes back, or someone breaks glass.
+- The Event is recorded when the webhook admits the change. If something later in the request fails
+  it, such as another webhook or a conflict, the Event describes a change that didn't land.
+- Each override needs its own reason. Removing the annotation afterwards is not an image change, so it
+  is always allowed.
+- Every use is its own Event. client-go's events recorder folds Events together only when they are
+  about the same object at the same `resourceVersion`, and every admitted update changes it.
+
+---
+
+## ADR-019: Ready means every resource is applied and the Rollout is healthy
+
+**Status:** Accepted (Day 5)
+
+**Context.** Until Day 5, `Ready` was a placeholder that was always `False`. The claim already has
+separate conditions for its resources (`ResourcesSynced`), its SLO (`SLOHealthy`) and its deploy
+policy (`DeploysFrozen`). `Ready` should answer a different question: is the service running as
+claimed?
+
+**Decision.** `Ready` is `True` when `ResourcesSynced` is `True` and Argo Rollouts reports the
+Rollout `Healthy` at its current generation (`status.observedGeneration` equals
+`metadata.generation`). Otherwise it is `False`, with reason `RolloutProgressing` (including canary
+pauses), `RolloutDegraded`, `RolloutNotFound`, or the reason from `ResourcesSynced`. The controller
+reads the Rollout without the cache, right after applying it, because a cached copy from before the
+apply would still report the previous generation as healthy.
+
+**Consequences.**
+- `Ready` is `False` for the whole of every canary rollout.
+- A service can be `Ready` while it is out of budget or frozen: those are separate conditions.
+- Each reconcile makes one more uncached GET.
+
+---
+
+## ADR-020: Services create their request series at zero when they start
+
+**Status:** Accepted (Day 5)
+
+**Context.** On Day 4, a claim's first 40 errors never reached its budget. Each pod created its
+`code="500"` series with the first failure, and Prometheus's `rate()` counts increases between
+samples, not the value a series first appears with. Every pod start has that gap, and a busy
+service that restarts often would look more reliable than it is.
+
+**Decision.** The service contract in the README asks every service to create its request series,
+for every status code it returns, at zero before serving. `examples/testsvc` does this for
+`code="200"` and `code="500"` in both `http_requests_total` and `http_request_duration_seconds`,
+from image 0.1.1.
+
+**Consequences.**
+- The first failure after a pod start counts. Measured on Day 5: before any traffic, Prometheus
+  already had `http_requests_total{code="500"} 0` for each url-shortener pod.
+- Each pod exposes a few more series.
+- A service that returns other codes must create those series too, or the first of each will be
+  missed. The rules can't fix this: the missing increase never reaches Prometheus.

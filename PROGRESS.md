@@ -6,6 +6,7 @@
 | 2 | Reconcile loop and 11 managed resources | Done 2026-09-12 |
 | 3 | SLI recording rules, burn-rate alerts, dashboard | Done 2026-09-13 |
 | 4 | Error budget in status, drift correction | Done 2026-09-13 |
+| 5 | Admission webhook: freeze deploys on budget exhaustion | Done 2026-09-13 |
 
 ## BLOCKED
 
@@ -578,3 +579,169 @@ Extra checks beyond the acceptance list:
   service contract, so it is raised with the user rather than done here.
 - `kubectl get --watch-only --output-watch-events -o name` prints no event type, which is why the
   first restore-time script never saw `ADDED`. The measurement uses the default table output.
+
+---
+
+## Day 5: admission webhook, deploy freeze on budget exhaustion
+
+Agreed with the user before building (2026-09-13):
+- While the budget can't be measured, `DeploysFrozen` keeps its last decision.
+- `paved.dev/break-glass` counts only when the update that changes the image also sets or changes
+  it, and a blank reason counts as none.
+- The demo ships a break-glass hotfix, and shows its Event, between the rejection and the recovery.
+- The proposed defaults:
+  - `Ready` means synced plus a healthy Rollout.
+  - testsvc creates its request series at zero (the open item from Day 4), in its own commit.
+  - `make docker-build` imports the image into k3d, and `make run` runs without webhooks.
+  - `failurePolicy: Fail`, and a rollback needs break-glass during a freeze.
+  - The rejection message is one line.
+  - `BreakGlassUsed` is a `Warning` Event from `paved-webhook`, never recorded for dry runs.
+  - The webhook trusts `DeploysFrozen` as last written, and a fast burn alone doesn't freeze.
+
+### Acceptance
+
+Run on 2026-09-13 against the running cluster, with both example claims in place and the controller
+deployed in `paved-system`. Output is copied from the terminal and shortened where marked.
+
+```text
+$ make docker-build deploy
+make exit code: 0
+#15 naming to docker.io/library/paved-controller:dev done
+INFO[0003] Importing images from tarball '/k3d/images/k3d-paved-images-20260913181131.tar' into node 'k3d-paved-server-0'...
+(kubectl apply output; every other object "unchanged")
+certificate.cert-manager.io/paved-serving-cert unchanged
+issuer.cert-manager.io/paved-selfsigned-issuer unchanged
+validatingwebhookconfiguration.admissionregistration.k8s.io/paved-validating-webhook-configuration configured
+
+# cert-manager issued the serving certificate before anything relied on it
+$ kubectl wait --for=condition=Ready certificate/paved-serving-cert -n paved-system --timeout=120s
+certificate.cert-manager.io/paved-serving-cert condition met
+$ kubectl get certificate -n paved-system
+NAME                 READY   SECRET                AGE
+paved-serving-cert   True    webhook-server-cert   52m
+$ kubectl get secret webhook-server-cert -n paved-system
+NAME                  TYPE                DATA   AGE
+webhook-server-cert   kubernetes.io/tls   3      52m
+$ kubectl get pods -n paved-system
+NAME                                        READY   STATUS    RESTARTS   AGE
+paved-controller-manager-6c94dc8c7f-r4dk5   1/1     Running   0          20m
+
+$ kubectl get validatingwebhookconfiguration | grep paved
+paved-validating-webhook-configuration   1          52m
+
+$ ./demo/freeze-demo.sh
+freeze-demo.sh exit code: 0 after 487 s
+(key lines from its output:)
+# Setup: put url-shortener back on k3d-paved-registry:5001/testsvc:0.1.1
+# A bad release: some requests now fail (the demo sends them to /boom)
+  budget 0.0%    1h burn rate 0.89   DeploysFrozen=True (BudgetExhausted)  Ready=True
+  budget 0.0%    1h burn rate 1.03   DeploysFrozen=True (BudgetExhausted)  Ready=True
+No 28d error budget left; image changes are rejected until 5.0% of it is back
+# The next release, 0.2.0, is ready. Try to ship it
+Error from server (Forbidden): admission webhook "vserviceclaim-v1alpha1.paved.dev" denied the request: deploys frozen: url-shortener has 0% error budget remaining in a 28d window (burn rate 1.0x). Override with annotation paved.dev/break-glass="<reason>" — this is audited.
+# An urgent hotfix can still go out, on the record: break-glass with a reason
+Warning: deploys are frozen: this image change was let through by paved.dev/break-glass and recorded in a BreakGlassUsed Event
+serviceclaim.platform.paved.dev/url-shortener patched
+# The hotfix is out and the errors stop
+  budget 0.0%    1h burn rate 1.15   DeploysFrozen=True (BudgetExhausted)  Ready=False
+  budget 14.7%   1h burn rate 1.15   DeploysFrozen=False (WithinBudget)  Ready=False
+# Deploys are unfrozen. Retry the same release
+serviceclaim.platform.paved.dev/url-shortener patched
+url-shortener   k3d-paved-registry:5001/testsvc:0.2.0   Healthy
+# Done: nothing shipped while the budget was gone, except one change that is on the record
+
+$ kubectl get events -A --field-selector reason=BreakGlassUsed
+NAMESPACE         LAST SEEN   TYPE      REASON           OBJECT                       MESSAGE
+platform-claims   27m         Warning   BreakGlassUsed   serviceclaim/url-shortener   system:admin changed the image from k3d-paved-registry:5001/testsvc:0.1.1 to k3d-paved-registry:5001/testsvc:0.1.2 during a deploy freeze: INC-1234: hotfix for the 500s
+platform-claims   19m         Warning   BreakGlassUsed   serviceclaim/url-shortener   system:admin changed the image from k3d-paved-registry:5001/testsvc:0.1.1 to k3d-paved-registry:5001/testsvc:0.1.2 during a deploy freeze: INC-1234: hotfix for the 500s
+platform-claims   11m         Warning   BreakGlassUsed   serviceclaim/url-shortener   system:admin changed the image from k3d-paved-registry:5001/testsvc:0.1.1 to k3d-paved-registry:5001/testsvc:0.1.2 during a deploy freeze: INC-1234: hotfix for the 500s
+platform-claims   2m48s       Warning   BreakGlassUsed   serviceclaim/url-shortener   system:admin changed the image from k3d-paved-registry:5001/testsvc:0.1.1 to k3d-paved-registry:5001/testsvc:0.1.2 during a deploy freeze: INC-1234: hotfix for the 500s
+
+$ kubectl get serviceclaims -A
+NAMESPACE         NAME               TIER     OWNER               BUDGET   FROZEN   READY   AGE
+platform-claims   url-shortener      public   team-links          39.8%    False    True    16h
+platform-claims   webhook-delivery   public   team-integrations   100.0%   False    True    16h
+
+controller ERROR log lines: 0
+```
+
+The four `BreakGlassUsed` Events are the four demo runs of the day, each recorded separately: the
+first unattended run, two recordings, and this acceptance run. Each run's Event shows up in the
+next run's output, so the audit trail keeps every use.
+
+Extra checks beyond the acceptance list:
+
+- **cert-manager issued the certificate before anything relied on it.** Certificate
+  `paved-serving-cert` was `Ready=True` with Secret `webhook-server-cert` (`kubernetes.io/tls`) for
+  `paved-webhook-service.paved-system.svc` and `.svc.cluster.local`. Its CA was injected into
+  `paved-validating-webhook-configuration`, valid until 2026-12-12, and was still there after
+  redeploys.
+- **`failurePolicy: Fail` holds.** With the controller scaled to zero, `kubectl annotate` on a claim
+  failed with `failed calling webhook "vserviceclaim-v1alpha1.paved.dev" ... no endpoints available`.
+  Once it was back, the same write was admitted.
+- **The request series exist before any traffic.** Prometheus had `http_requests_total{code="200"} 0`
+  and `{code="500"} 0` for both url-shortener pods on testsvc 0.1.1.
+- **`Ready` follows the Rollout.** After the controller was redeployed, both claims were
+  `Ready=True (RolloutHealthy)`. During the demo's canary it went `False` and came back `True`.
+- **Recording:** `demo/03-freeze.cast` (asciinema, 120x34, idle time limit 2 s) is a full run of
+  `demo/freeze-demo.sh`. It shows the budget draining from 91.7% to 0.0% and the rejection with
+  `burn rate 1.0x`. Then the break-glass Event, the recovery to 11.2% that unfreezes deploys, and 0.2.0
+  rolled out with `Ready=True`.
+- **Redeploys leave the CA bundle alone.** `make deploy` prints `configured` for the
+  ValidatingWebhookConfiguration each time. Its managedFields show cert-manager's cainjector last
+  wrote at 21:19:03 and the generation is 3 (create, CA injection, the `sideEffects` change), so no
+  redeploy removed the injected CA.
+- **envtest and unit tests** cover the freeze through the real reconcile: exhausted, recovering at 3%,
+  held while Prometheus is down, unfrozen at 6%, still unfrozen back at 3%. They also cover every `Ready`
+  reason. Through the API server they cover a rejected image change (`403 Forbidden`, with the
+  message), an admitted scale change, and a break-glass change whose Event lands. Unit tests cover the
+  exact message, `unknown` values, stale and blank reasons, dry runs, and a long reason kept within
+  the Event size limit.
+
+### Measurements
+
+| What | Value | How measured |
+|---|---|---|
+| Controller memory | 41 MiB of its 128 MiB limit, with two claims, shortly after start | `kubectl top pod -n paved-system` |
+| Unattended `freeze-demo.sh` runs | 4 min 35 s (first run, error bursts); 487 s (acceptance run, including the setup canary) | Wall clock from start to exit 0 |
+| `demo/03-freeze.cast` | 346 s recorded, about 50 s of playback | Sum of the cast's event intervals, uncapped and capped at the 2 s idle limit |
+| Statement coverage | builders 90.2%, controller 89.1%, slo 93.0%, webhook 95.1% | `make test` |
+
+### Deviations from the spec
+
+- **Six commits.** The user asked for at least five, and the test service fix is its own commit.
+- **The hotfix tag is 0.1.2.** 0.1.1 carries the request-series fix and became the example claims'
+  image, so the demo starts on 0.1.1, hotfixes to 0.1.2 and releases 0.2.0.
+- **The webhook is named `vserviceclaim-v1alpha1.paved.dev`.** The scaffold's `.kb.io` is kubebuilder's
+  placeholder domain.
+- **The scaffold's metrics certificate is left out**, since nothing uses it (ADR-016).
+- **The rejection message is one line**, which the spec wraps only for display. `0%` and `14.2x`
+  are the status values `0.0%` and `14.20`, shortened for the message.
+- **The demo's hotfix and release are the same test service under new tags.** The errors stop because
+  the script stops sending requests to `/boom`, and it sends much more traffic to speed the recovery.
+  The narration says both.
+- **The controller commit was amended before the push** to read the Rollout without the cache. The
+  demo's final wait showed that a cached Rollout from before an apply could report `Ready` for the
+  previous generation (ADR-019).
+
+### Notes for later days
+
+- **The first demo run sent errors in bursts, which the recording can't use.** Its rejection read
+  `burn rate 0.0x`, because the 1h recording rule, evaluated every 30 s, lagged the raw window query.
+  And 50 errors against a minute of traffic spent the budget only 1.32x, so the freeze could lift
+  within a minute. The demo now sends a steady trickle of errors until the hotfix ships, and waits
+  for a non-zero burn rate before trying to ship.
+- **`BudgetRecovering` rarely shows in the demo.** With only minutes of history, the budget can pass
+  from 0% to over 5% between two reconciles (run 1 went from 0.0% straight to 16.2%). envtest and the
+  unit tests cover that state.
+- **Restarting the k3d cluster recreated the Prometheus pod**, and its `emptyDir` storage lost every
+  sample. After a cluster restart, all budgets start again from no data, so Day 4's 0.0% budget for
+  url-shortener is gone.
+- **BreakGlassUsed Events expire** after the API server's default `--event-ttl` of one hour. The
+  Events check has to run within an hour of the demo.
+- url-shortener still carries a `kick: day3` annotation from Day 3 testing.
+- **Resolved spec questions:** the unfreeze threshold (5%), rollbacks during a freeze (they need
+  break-glass) and the webhook failure policy (`Fail`).
+- **Still open:** claim name and namespace validation, ingress TLS, the batch tier's ServiceMonitor,
+  and the `platform-system` namespace that managed NetworkPolicies admit. The controller runs in
+  `paved-system`, but it never calls the services, so nothing is blocked.
