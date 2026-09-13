@@ -23,11 +23,14 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -37,16 +40,19 @@ import (
 )
 
 // The specs share one claim and run in order through its lifecycle: create, reconcile again,
-// repair drift, delete.
+// repair drift, change the spec, delete.
 var _ = Describe("ServiceClaim Controller", Ordered, func() {
 	const (
 		claimName      = "test-claim"
 		claimNamespace = "default"
+		managedNS      = "svc-" + claimName
 	)
 
 	var (
 		ctx        = context.Background()
 		key        = types.NamespacedName{Name: claimName, Namespace: claimNamespace}
+		managedKey = types.NamespacedName{Name: claimName, Namespace: managedNS}
+		recorder   *events.FakeRecorder
 		reconciler *ServiceClaimReconciler
 	)
 
@@ -80,11 +86,14 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 	}
 
 	BeforeAll(func() {
+		recorder = events.NewFakeRecorder(20)
 		reconciler = &ServiceClaimReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			// Half the 28d budget spent, burning at 0.1x over the last hour.
 			Prometheus: &fakeQuerier{window: queryResult{value: 0.0025}, hour: queryResult{value: 0.0005}},
+			APIReader:  k8sClient,
+			Recorder:   recorder,
 		}
 		Expect(k8sClient.Create(ctx, &platformv1alpha1.ServiceClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: claimName, Namespace: claimNamespace},
@@ -107,6 +116,7 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		claim := getClaim()
 		Expect(controllerutil.ContainsFinalizer(claim, Finalizer)).To(BeTrue())
 		Expect(resourceVersions(claim)).To(HaveLen(11))
+		Expect(recorder.Events).To(BeEmpty(), "creating a claim's resources is not drift")
 
 		synced := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionResourcesSynced)
 		Expect(synced).NotTo(BeNil())
@@ -149,18 +159,20 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		Expect(healthy.Reason).To(Equal(ReasonPrometheusUnavailable))
 		synced := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionResourcesSynced)
 		Expect(synced.Status).To(Equal(metav1.ConditionTrue), "resources must still be reconciled")
+		Expect(recorder.Events).To(BeEmpty())
 	})
 
-	It("leaves every resourceVersion unchanged when it reconciles again", func() {
+	It("leaves every resourceVersion unchanged, and reports no drift, when it reconciles again", func() {
 		reconcileClaim()
 		before := resourceVersions(getClaim())
 
 		reconcileClaim()
 
 		Expect(resourceVersions(getClaim())).To(Equal(before))
+		Expect(recorder.Events).To(BeEmpty())
 	})
 
-	It("recreates a managed object that was deleted", func() {
+	It("recreates a managed object that was deleted, and records DriftCorrected", func() {
 		svc := builders.BuildService(getClaim())
 		Expect(k8sClient.Delete(ctx, svc)).To(Succeed())
 		err := k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), &corev1.Service{})
@@ -169,6 +181,35 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		reconcileClaim()
 
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), &corev1.Service{})).To(Succeed())
+		Expect(recorder.Events).To(Receive(Equal("Normal DriftCorrected Recreated Service svc-test-claim/test-claim")))
+		Expect(recorder.Events).To(BeEmpty(), "only the deleted object was drift")
+	})
+
+	It("reverts an edit to a managed object, and records DriftCorrected", func() {
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, managedKey, np)).To(Succeed())
+		np.Spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
+		Expect(k8sClient.Update(ctx, np)).To(Succeed())
+
+		reconcileClaim()
+
+		Expect(k8sClient.Get(ctx, managedKey, np)).To(Succeed())
+		Expect(np.Spec.PolicyTypes).To(Equal([]networkingv1.PolicyType{networkingv1.PolicyTypeIngress}))
+		Expect(recorder.Events).To(Receive(Equal("Normal DriftCorrected Reverted changes to NetworkPolicy svc-test-claim/test-claim")))
+		Expect(recorder.Events).To(BeEmpty())
+	})
+
+	It("applies a spec change without reporting it as drift", func() {
+		claim := getClaim()
+		claim.Spec.Scale.Max = 5
+		Expect(k8sClient.Update(ctx, claim)).To(Succeed())
+
+		reconcileClaim()
+
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		Expect(k8sClient.Get(ctx, managedKey, hpa)).To(Succeed())
+		Expect(hpa.Spec.MaxReplicas).To(Equal(int32(5)))
+		Expect(recorder.Events).To(BeEmpty(), "a change the claim asked for is not drift")
 	})
 
 	It("deletes the namespace, then releases the finalizer once the namespace is gone", func() {
@@ -179,7 +220,7 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 		ns := &corev1.Namespace{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-" + claimName}, ns)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: managedNS}, ns)).To(Succeed())
 		Expect(ns.DeletionTimestamp).NotTo(BeNil())
 		Expect(controllerutil.ContainsFinalizer(getClaim(), Finalizer)).To(BeTrue())
 

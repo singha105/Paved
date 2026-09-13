@@ -230,6 +230,8 @@ func main() {
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
 		Prometheus: prometheus,
+		APIReader:  mgr.GetAPIReader(),
+		Recorder:   mgr.GetEventRecorder("paved-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "serviceclaim")
 		os.Exit(1)

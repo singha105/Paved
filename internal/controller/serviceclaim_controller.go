@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -71,6 +72,11 @@ type ServiceClaimReconciler struct {
 	// Prometheus answers the SLO queries. When it is nil or unreachable, SLOHealthy is Unknown
 	// and resources are still reconciled (DECISIONS.md, ADR-014).
 	Prometheus slo.Querier
+	// APIReader reads managed objects straight from the API server, to tell a drift correction
+	// from an apply that changed nothing. When nil, drift isn't reported.
+	APIReader client.Reader
+	// Recorder records DriftCorrected Events. When nil, corrections are only logged.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=platform.paved.dev,resources=serviceclaims,verbs=get;list;watch;create;update;patch;delete
@@ -82,11 +88,12 @@ type ServiceClaimReconciler struct {
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=argoproj.io,resources=rollouts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors;prometheusrules,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile applies every object a ServiceClaim's tier requires, reads the claim's error
-// budget from Prometheus, and reports both in the claim's status. It requeues every minute
-// to keep the budget current. A deleted claim is finalized instead: its namespace is deleted,
-// and the finalizer is released once the namespace is gone.
+// Reconcile applies every object a ServiceClaim's tier requires, reports any it had to put
+// back, reads the claim's error budget from Prometheus, and records all of it in the claim's
+// status. It requeues every minute to keep the budget current. A deleted claim is finalized
+// instead: its namespace is deleted, and the finalizer is released once the namespace is gone.
 func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -135,7 +142,12 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}}
 		return ctrl.Result{}, r.applyStatus(ctx, &claim, invalid, 0, report)
 	}
-	applied, applyErr := r.applyObjects(ctx, objects)
+
+	wasInSync := inSyncAtGeneration(&claim)
+	applied, corrections, applyErr := r.applyObjects(ctx, objects)
+	if wasInSync {
+		r.reportDrift(ctx, &claim, corrections)
+	}
 
 	synced := metav1.Condition{
 		Type:               platformv1alpha1.ConditionResourcesSynced,
@@ -165,18 +177,28 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 }
 
 // applyObjects server-side applies objects in order and stops at the first failure, because
-// every later object lives in the Namespace applied first. It returns how many were applied.
-func (r *ServiceClaimReconciler) applyObjects(ctx context.Context, objects []client.Object) (int, error) {
+// every later object lives in the Namespace applied first. It returns how many were applied
+// and which objects the applies had to recreate or put back (DECISIONS.md, ADR-015).
+func (r *ServiceClaimReconciler) applyObjects(ctx context.Context, objects []client.Object) (int, []correction, error) {
+	var corrections []correction
 	for i, obj := range objects {
 		u, err := toApplyObject(obj)
 		if err != nil {
-			return i, err
+			return i, corrections, err
 		}
+		before, existed, err := r.liveOwnership(ctx, u)
+		if err != nil {
+			return i, corrections, err
+		}
+		// The apply writes the server's response back into u.
 		if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(u), FieldOwner, client.ForceOwnership); err != nil {
-			return i, fmt.Errorf("applying %s %s: %w", u.GetKind(), client.ObjectKeyFromObject(obj), err)
+			return i, corrections, fmt.Errorf("applying %s %s: %w", u.GetKind(), client.ObjectKeyFromObject(obj), err)
+		}
+		if r.APIReader != nil && (!existed || !sameOwnership(before, controllerOwnership(u))) {
+			corrections = append(corrections, correction{kind: u.GetKind(), ref: objectRef(u), recreated: !existed})
 		}
 	}
-	return len(objects), nil
+	return len(objects), corrections, nil
 }
 
 // finalize deletes the claim's namespace, which removes every managed object inside it, and

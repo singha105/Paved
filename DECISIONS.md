@@ -376,3 +376,34 @@ on Prometheus: they are reconciled whether or not the SLO can be read.
   that looks current.
 - Each reconcile makes at most two queries, and stops after the first if Prometheus fails, so an
   outage costs one 5-second timeout per claim per minute.
+
+---
+
+## ADR-015: Drift is detected from the controller's own field ownership
+
+**Status:** Accepted (Day 4)
+
+**Context.** The controller re-applies every managed object on every reconcile, which already
+puts back anything deleted or edited. Reporting that as a `DriftCorrected` Event means telling a
+real correction apart from everything else that changes those objects: the HPA rewrites the
+Rollout's replica count, Argo Rollouts and the HPA update status constantly, and a new claim or
+a spec edit changes objects on purpose. Comparing `resourceVersion`s before and after an apply
+would report all of those as drift.
+
+**Decision.** Before applying an object, the controller reads it straight from the API server,
+bypassing the cache, and keeps the server-side apply entry for `paved-controller`: the fields it
+owns and when they last changed. After the apply it compares that with the entry in the
+server's response. The object had drifted if it didn't exist, or if the entry changed, meaning
+the apply had to take fields back from another manager or reset their values. Events are only
+recorded when the claim was already in sync at its current generation, so creating a claim's
+resources and applying a spec edit never count.
+
+**Consequences.**
+- Other controllers' writes never touch `paved-controller`'s entry, and an apply that changes
+  nothing leaves it byte-for-byte identical, so routine activity produces no Events.
+- A change to a field the controller doesn't own, such as an extra label, isn't drift. It is
+  left alone and not reported.
+- Each correction is one `Normal` Event on the ServiceClaim, for example
+  `Recreated PrometheusRule svc-url-shortener/url-shortener`.
+- Every reconcile makes one uncached GET per managed object: 12 per public claim, at least once
+  a minute.
