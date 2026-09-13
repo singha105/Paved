@@ -23,4 +23,4 @@ webhooks:
     - UPDATE
     resources:
     - serviceclaims
-  sideEffects: None
+  sideEffects: NoneOnDryRun
