@@ -17,9 +17,12 @@ jobs:
     permissions:
       contents: read
       packages: write
-    env:
-      IMAGE: ghcr.io/${{ github.repository }}
     steps:
+      # GHCR accepts only lowercase image names, and the repository is singha105/Paved. Lowercasing it
+      # keeps the image at ghcr.io/singha105/paved, the package deploy/operator pins.
+      - name: Name the image in lowercase
+        run: echo "IMAGE=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       # Every action is pinned to a full commit SHA: in March 2026 most of trivy-action's version
       # tags were force-pushed to credential-stealing code (CVE-2026-33634).
       - name: Clone the code
