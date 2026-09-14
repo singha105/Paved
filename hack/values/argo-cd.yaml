@@ -1,0 +1,6 @@
+# Argo CD values for the local paved cluster: only what the app-of-apps needs.
+# No SSO (the admin login is enough locally) and no notifications, to save memory.
+dex:
+  enabled: false
+notifications:
+  enabled: false

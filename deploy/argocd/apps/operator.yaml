@@ -1,0 +1,38 @@
+# The paved operator: its CRD, RBAC, controller Deployment, admission webhook and the webhook's
+# cert-manager certificate, from deploy/operator. The image is the one CI scanned and pushed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: paved-operator
+  namespace: argocd
+  annotations:
+    # Before the claims: they need the CRD and the webhook.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/singha105/paved.git
+    targetRevision: main
+    path: deploy/operator
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: paved-system
+  # cert-manager's cainjector writes the webhook's CA bundle; git never has it.
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jqPathExpressions:
+        - .webhooks[]?.clientConfig.caBundle
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

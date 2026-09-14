@@ -1,0 +1,21 @@
+# The root of the app-of-apps: an Argo CD Application whose only job is to create the platform's
+# other Applications from deploy/argocd/apps. hack/cluster-up.sh applies it once; everything
+# after that comes from git (DECISIONS.md, ADR-023).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: paved
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/singha105/paved.git
+    targetRevision: main
+    path: deploy/argocd/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

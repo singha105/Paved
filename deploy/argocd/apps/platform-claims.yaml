@@ -1,0 +1,32 @@
+# The platform-claims namespace and every ServiceClaim in it, from deploy/claims. Changing a claim
+# means committing to git: Argo CD applies it, and self-heal puts back any change made with kubectl.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-claims
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/singha105/paved.git
+    targetRevision: main
+    path: deploy/claims
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: platform-claims
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    # A claim's first sync can come before the operator's webhook is serving, and an image change
+    # is rejected while the claim's deploys are frozen; both clear on a later attempt.
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

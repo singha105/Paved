@@ -93,9 +93,26 @@ load() {
 }
 TRAFFIC=$(mktemp -t paved-demo-traffic)
 ERRORS=$(mktemp -t paved-demo-errors)
+# Argo CD applies the claims from git and self-heals them, which would undo this demo's kubectl
+# patches. While the demo runs, automated sync is off for the root app, which would otherwise put
+# the claims app's policy back, and for the claims app. Cleanup turns it back on, and Argo CD
+# then returns the claim to what git says.
+GITOPS_APPS=(paved platform-claims)
+GITOPS_PAUSED=false
+gitops_manages_claims() { kubectl get application platform-claims -n argocd >/dev/null 2>&1; }
+# set_automated_sync POLICY_JSON: set spec.syncPolicy.automated on every GitOps app.
+set_automated_sync() {
+  local app
+  for app in "${GITOPS_APPS[@]}"; do
+    kubectl patch application "$app" -n argocd --type merge -p "{\"spec\":{\"syncPolicy\":{\"automated\":$1}}}" >/dev/null
+  done
+}
 cleanup() {
   rm -f "$TRAFFIC" "$ERRORS"
   wait
+  if [ "$GITOPS_PAUSED" = true ]; then
+    set_automated_sync '{"prune":true,"selfHeal":true}'
+  fi
 }
 trap cleanup EXIT
 
@@ -103,6 +120,11 @@ command -v ab >/dev/null || fail "ab (ApacheBench) is required to send traffic"
 kubectl get serviceclaim "$CLAIM" -n "$CLAIM_NS" >/dev/null
 if is_frozen; then
   fail "$CLAIM's deploys are still frozen from an earlier run; let its budget recover, then run again"
+fi
+if gitops_manages_claims; then
+  say "Argo CD manages this claim from git: pausing its automated sync until the demo ends"
+  set_automated_sync null
+  GITOPS_PAUSED=true
 fi
 if [ "$(field '{.spec.image}')" != "$CURRENT" ] || [ -n "$(field '{.metadata.annotations.paved\.dev/break-glass}')" ]; then
   say "Setup: put $CLAIM back on $CURRENT"

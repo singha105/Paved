@@ -1,0 +1,11 @@
+# The paved operator as Argo CD deploys it: config/default (CRD, RBAC, controller, webhook and its
+# cert-manager certificate) with the image CI scanned and pushed to GHCR. Rolling out a new operator
+# version means committing a new tag here (DECISIONS.md, ADR-023).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../config/default
+images:
+  - name: paved-controller
+    newName: ghcr.io/singha105/paved
+    newTag: sha-8d12dc8

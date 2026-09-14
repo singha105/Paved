@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # cluster-up.sh: create the local "paved" k3d cluster with its image registry, and install
-# the platform stack (cert-manager, Traefik, Argo Rollouts, kube-prometheus-stack).
+# the platform stack (cert-manager, Traefik, Argo Rollouts, kube-prometheus-stack, Argo CD). Argo CD
+# then delivers the operator and the claims from git (deploy/argocd).
 #
 # Idempotent: re-running reuses the registry and the cluster and upgrades each Helm release in
 # place. Readiness is checked with `kubectl wait`, never `sleep`.
@@ -11,6 +12,7 @@ CLUSTER_NAME="${CLUSTER_NAME:-paved}"
 KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600s}"
 VALUES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/values"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # The registry is localhost:${REGISTRY_PORT} from this machine and ${REGISTRY}:${REGISTRY_PORT}
 # from inside the cluster. Port 5000 is taken by macOS AirPlay Receiver.
@@ -23,6 +25,7 @@ CERT_MANAGER_VERSION="v1.21.2"
 TRAEFIK_VERSION="41.5.0"
 ARGO_ROLLOUTS_VERSION="2.43.1"
 KUBE_PROMETHEUS_STACK_VERSION="90.1.2"
+ARGO_CD_VERSION="10.9.0"  # Argo CD v3.5.2, added on Day 6
 
 log() { printf '\n==> %s\n' "$*"; }
 
@@ -120,6 +123,18 @@ install_stack() {
   k -n monitoring wait --for=condition=Available alertmanager --all --timeout="$WAIT_TIMEOUT"
   k -n monitoring wait --for=condition=Ready pod --all \
     --field-selector=status.phase!=Succeeded --timeout="$WAIT_TIMEOUT"
+
+  install_chart argocd argocd argo/argo-cd "$ARGO_CD_VERSION" \
+    --values "$VALUES_DIR/argo-cd.yaml"
+  k -n argocd wait --for=condition=Available deployment --all --timeout="$WAIT_TIMEOUT"
+  k -n argocd rollout status statefulset --timeout="$WAIT_TIMEOUT"
+}
+
+# bootstrap_gitops applies the root of the app-of-apps. From then on Argo CD installs and updates
+# the operator and the claims from git.
+bootstrap_gitops() {
+  log "Applying the Argo CD root application (deploy/argocd/root.yaml)"
+  k apply -f "$REPO_ROOT/deploy/argocd/root.yaml"
 }
 
 main() {
@@ -128,6 +143,7 @@ main() {
   ensure_cluster
   add_repos
   install_stack
+  bootstrap_gitops
   log "Cluster '$CLUSTER_NAME' is ready (kubectl context: $KUBE_CONTEXT, registry: localhost:$REGISTRY_PORT)"
 }
 
