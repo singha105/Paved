@@ -418,7 +418,7 @@ firing  service=url-shortener severity=ticket windows=3d/6h
 "summary": "url-shortener is spending its error budget 14.4x faster than it can sustain"
 ```
 
-The other alert names are kube-prometheus-stack's own default alerts; paved doesn't generate them,
+The other alert names are kube-prometheus-stack's own default alerts; Paved doesn't generate them,
 and they weren't investigated.
 
 Extra checks beyond the acceptance list:
@@ -472,7 +472,7 @@ Extra checks beyond the acceptance list:
 - **The acceptance port-forward targets `svc/kps-kube-prometheus-stack-prometheus`**, because the Helm
   release is named `kps`.
 - **README.md was rewritten** from the kubebuilder boilerplate to hold the service contract the spec
-  asks for, plus what paved is and how to run it.
+  asks for, plus what Paved is and how to run it.
 
 ### Notes for later days
 
@@ -872,7 +872,7 @@ Extra checks beyond the acceptance list:
 
 | What | Value | How measured |
 |---|---|---|
-| Canary abort time | 62 s in the recording, 63 s and 63 s in two more runs (median 63 s). A first attempt, whose revert step failed, measured 70 s. One run that aborted after 5 s, on errors left from an earlier run, is excluded | From the time paved's server-side apply put the bad image on the Rollout (its `managedFields` entry) to the Rollout's `status.abortedAt` |
+| Canary abort time | 62 s in the recording, 63 s and 63 s in two more runs (median 63 s). A first attempt, whose revert step failed, measured 70 s. One run that aborted after 5 s, on errors left from an earlier run, is excluded | From the time Paved's server-side apply put the bad image on the Rollout (its `managedFields` entry) to the Rollout's `status.abortedAt` |
 | Argo CD memory | 126 MiB across its five pods, just after install | `kubectl top pods -n argocd` |
 | `demo/04-canary.cast` | 217 s recorded, about 23 s of playback | Sum of the cast's event intervals, uncapped and capped at the 2 s idle limit |
 | url-shortener error budget spent by five bad canaries | 38.5% remaining before, 28.1% after | `kubectl get serviceclaims` |
@@ -908,7 +908,7 @@ Extra checks beyond the acceptance list:
 - **The `gvenzl/oracle-xe` images (14.6 GB) are still there.** Deleting them was blocked by the
   permission check.
 - **A controller upgrade that changes the builders is reported as drift.** When the analysis builder
-  was deployed, both claims got `DriftCorrected` Events for their Rollouts, because paved's own field
+  was deployed, both claims got `DriftCorrected` Events for their Rollouts, because Paved's own field
   set changed (ADR-015). Telling an upgrade from an edit needs more design.
 - **A Prometheus outage can abort a canary.** Query errors count against Argo Rollouts' default
   `consecutiveErrorLimit` of 4, the opposite of the fail-open rule in ADR-014 (ADR-022).
@@ -927,12 +927,12 @@ Extra checks beyond the acceptance list:
 ## Day 7: envtest suite, second service, documentation
 
 Agreed with the user before building (2026-09-14):
-- **The six envtest specs test what paved does.** Public claims get 13 objects, carrying the claim's
-  ownership labels and no owner references; batch claims get 8. The cascade spec proves paved's part,
+- **The six envtest specs test what Paved does.** Public claims get 13 objects, carrying the claim's
+  ownership labels and no owner references; batch claims get 8. The cascade spec proves Paved's part,
   deleting the namespace and holding the finalizer, and the full cascade is shown on the live cluster.
 - **Service #2 is `shortlink`.** It is a new URL shortener in `services/shortlink`, with its own
   module and image, onboarded as tier `internal`. The existing claims stay.
-- **`make demo` is verified from a clean clone.** The paved cluster and registry are deleted and
+- **`make demo` is verified from a clean clone.** The `paved` cluster and registry are deleted and
   rebuilt from `git clone`.
 - The proposed defaults:
   - The casts become GIFs rendered with agg 1.9.0.
@@ -1100,7 +1100,7 @@ Agreed with the user before building (2026-09-14):
     in an S3 bucket.
   - The spec's move to an always-free ARM instance, and with it the cross-cloud framing, is dropped
     (see the deviations below).
-- **ACK makes the AWS calls.** The ACK iam-controller (1.9.0) and s3-controller (1.12.1) do them; paved
+- **ACK makes the AWS calls.** The ACK iam-controller (1.9.0) and s3-controller (1.12.1) do them; Paved
   applies ACK `Role` and `Bucket` objects with server-side apply, like everything else it manages.
 - **Short-lived login only.**
   - AWS is reached through `aws login --profile paved`.
@@ -1110,7 +1110,7 @@ Agreed with the user before building (2026-09-14):
   a public-read S3 bucket.
 - **Two demo-only storage claims**, applied with kubectl by `demo/05-storage.sh`. `deploy/claims`
   doesn't change.
-- **`spec.storage` is fixed at creation** (CEL), because paved never deletes objects it stops building.
+- **`spec.storage` is fixed at creation** (CEL), because Paved never deletes objects it stops building.
 - The proposed defaults:
   - Storage is opt-in with `PAVED_AWS_PROFILE`, and every cluster-up republishes the signing keys.
   - The region is eu-west-2.
@@ -1126,7 +1126,7 @@ Agreed with the user before building (2026-09-14):
   - A storage claim's name has at most 48 characters.
   - The AWS settings live in a `paved-aws` ConfigMap, never in git.
   - Commits are pushed as work lands.
-  - The paved cluster is deleted and rebuilt with the AWS link.
+  - The `paved` cluster is deleted and rebuilt with the AWS link.
 
 ### Acceptance
 
@@ -1286,12 +1286,12 @@ $ git log -p --all | grep -c "$ACCOUNT_ID"
   long-lived credential exists, but root can do far more than this needs. An admin IAM user, or IAM
   Identity Center, would be better.
 - **STS rejects the k3s default token audiences** ("Token audience contains more than one audience"),
-  so a pod needs a projected token whose only audience is `sts.amazonaws.com`. That is what paved
+  so a pod needs a projected token whose only audience is `sts.amazonaws.com`. That is what Paved
   injects.
 - **With the AWS link, the single k3d node is at its memory limit.**
   - The k3s server container used 3.48 GiB of the Docker VM's 4.8 GiB, with its 1 GiB swap full and
     CPU at 268%.
-  - The API server slowed: paved lost its leader-election lease (`context deadline exceeded`) and
+  - The API server slowed: Paved lost its leader-election lease (`context deadline exceeded`) and
     restarted at 21:35:01Z, and the ACK controllers failed probes.
   - Nothing was lost, since leadership comes back on restart, but timings taken under that load
     aren't representative.

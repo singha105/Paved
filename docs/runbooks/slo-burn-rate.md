@@ -1,6 +1,6 @@
 # Runbook: SLOErrorBudgetBurn
 
-`SLOErrorBudgetBurn` fires when a service claimed through paved is using up its error budget
+`SLOErrorBudgetBurn` fires when a service claimed through Paved is using up its error budget
 faster than its SLO allows. Every claim gets four of these alerts, generated from its
 `ServiceClaim`; they differ only in how fast the budget is burning and over which windows.
 

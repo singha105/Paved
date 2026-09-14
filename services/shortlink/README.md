@@ -1,6 +1,6 @@
 # shortlink
 
-A small URL shortener, and the second service onboarded onto paved. It is a separate Go module with
+A small URL shortener, and the second service onboarded onto Paved. It is a separate Go module with
 its own image. Nothing in it knows about the platform beyond the
 [service contract](../../README.md#the-service-contract).
 

@@ -4,13 +4,13 @@
 2026-09-14 (Day 7, commit `43c59a9`)
 
 The worst bug this week was not the loudest one. A full disk and a crashed Docker engine cost more
-hours, but they announced themselves. This one was silent, and it sat under every decision paved
+hours, but they announced themselves. This one was silent, and it sat under every decision Paved
 makes: the error budget in status, the burn-rate alerts, the deploy freeze and, later, the canary
 analysis all read the same error ratio. That ratio was too low.
 
 ## Summary
 
-paved measures a service's availability from Prometheus's `rate()` over its `http_requests_total`
+Paved measures a service's availability from Prometheus's `rate()` over its `http_requests_total`
 counter. The test service created a counter series the first time it answered with a given status
 code. `rate()` can't see the increase that creates a series, so the failures that created each pod's
 `code="500"` series were never counted. After every pod start, the first burst of errors on each pod

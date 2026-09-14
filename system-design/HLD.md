@@ -1,6 +1,6 @@
-# paved: high-level design
+# Paved: high-level design
 
-This document describes what paved is made of and how the parts work together. The
+This document describes what Paved is made of and how the parts work together. The
 [low-level design](LLD.md) covers each part in detail, [DECISIONS.md](../DECISIONS.md) explains why
 each choice was made, and [PROGRESS.md](../PROGRESS.md) holds the output that proves each step. Every
 number here was measured on this project's local cluster; none is an estimate.
@@ -17,8 +17,8 @@ Every team that ships a service to Kubernetes rebuilds the same production scaff
 Each copy drifts from the others. Nobody measures whether the service meets its SLO, and nothing
 stops a team from shipping while it is already in an outage.
 
-paved is an internal developer platform built as a Kubernetes operator. A team writes one short
-`ServiceClaim`, and paved:
+Paved is an internal developer platform built as a Kubernetes operator. A team writes one short
+`ServiceClaim`, and Paved:
 - turns it into all of that scaffolding, and keeps it that way
 - reads the service's error budget from Prometheus
 - freezes deploys when the budget is gone
@@ -31,7 +31,7 @@ no AWS key anywhere.
 
 ### Goals
 
-1. **A controller, not a generator.** paved reconciles continuously: it puts back changed or deleted
+1. **A controller, not a generator.** Paved reconciles continuously: it puts back changed or deleted
    objects and reports what it sees in the claim's status.
 2. **SLOs drive deploy policy.** Error budgets and burn rates come from live Prometheus data. An
    admission webhook rejects image changes while a claim's budget is exhausted, with an audited
@@ -45,13 +45,13 @@ no AWS key anywhere.
 
 - **Configurability of the golden path.** Limits, probes, security context, rollout strategy and
   canary steps aren't fields in the API ([ADR-001](../DECISIONS.md#adr-001-developers-cannot-set-limits-security-context-rollout-strategy-probes-or-canary-steps)).
-- **Replacing CI or GitOps.** paved consumes a GitHub Actions pipeline and Argo CD; it doesn't build
+- **Replacing CI or GitOps.** Paved consumes a GitHub Actions pipeline and Argo CD; it doesn't build
   images or sync git itself.
 - **Multi-cluster operation.** One cluster, which is a local k3d cluster in this project.
 - **TLS for public ingress.** Public claims are served over plain HTTP on `<name>.localhost`.
 - **Scraping batch workloads.** A batch claim gets a ServiceMonitor, but it has no Service for it to
   match.
-- **Removing objects a claim stops producing.** paved applies what a claim needs and deletes the whole
+- **Removing objects a claim stops producing.** Paved applies what a claim needs and deletes the whole
   namespace with the claim, but doesn't prune individual objects. This is why `spec.storage` is fixed
   at creation.
 
@@ -62,7 +62,7 @@ flowchart LR
     dev["Developer"] -->|commits a ServiceClaim| git["GitHub repository"]
     git -->|CI: vet, test, scan, push| ghcr["GHCR<br/>operator image"]
     git -->|app-of-apps| argocd["Argo CD"]
-    argocd -->|applies| operator["paved operator<br/>controller and webhook"]
+    argocd -->|applies| operator["Paved operator<br/>controller and webhook"]
     argocd -->|applies| claims["ServiceClaims"]
     ghcr -->|image pulled| operator
     claims -->|watched| operator
@@ -78,7 +78,7 @@ flowchart LR
 
 The people involved:
 - **Service teams** write claims, commit them, and read their status.
-- **The platform team** owns paved, the golden path encoded in it, and the stack it runs on.
+- **The platform team** owns Paved, the golden path encoded in it, and the stack it runs on.
 
 ## 4. Building blocks
 
@@ -90,7 +90,7 @@ The people involved:
 | SLO engine | Error budget and burn-rate maths, recording rules, burn-rate alerts, Prometheus client | Linked into the controller | `internal/slo` |
 | Admission webhook | Rejects image changes to a frozen claim unless a new break-glass reason is set, and records an Event when break-glass is used | Same binary and pod as the controller | `internal/webhook/v1alpha1` |
 | Argo Rollouts | Runs each claim's canary and its SLI analysis, and aborts a failing canary | `argo-rollouts` | Helm chart 2.43.1 |
-| kube-prometheus-stack | Prometheus scrapes services and evaluates paved's rules; Alertmanager receives the alerts; Grafana loads each claim's dashboard | `monitoring` | Helm chart 90.1.2 |
+| kube-prometheus-stack | Prometheus scrapes services and evaluates Paved's rules; Alertmanager receives the alerts; Grafana loads each claim's dashboard | `monitoring` | Helm chart 90.1.2 |
 | cert-manager | Issues the webhook's serving certificate and injects its CA | `cert-manager` | Helm chart v1.21.2 |
 | Traefik | Ingress for public claims | `traefik` | Helm chart 41.5.0 |
 | Argo CD | Delivers the operator and the claims from git as an app-of-apps | `argocd` | Helm chart 10.9.0 (Argo CD v3.5.2) |
@@ -160,9 +160,9 @@ Rollout strategy:
 2. From the first pause, an analysis reads the same 5m SLI recording rule every 30 s.
 3. It aborts the rollout once the error ratio passes 5%. The stable version keeps serving.
 
-A release failing every request was aborted 62, 63 and 63 s after paved applied it.
+A release failing every request was aborted 62, 63 and 63 s after Paved applied it.
 
-### 6.5 Delivering paved itself
+### 6.5 Delivering Paved itself
 
 1. Every push runs CI.
 2. On `main`, the image is pushed to GHCR only after its Trivy scan has no fixable HIGH or CRITICAL

@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-Short records of the choices in paved that a reader would otherwise have to reverse-engineer.
+Short records of the choices in Paved that a reader would otherwise have to reverse-engineer.
 Each one says what was decided, why, and what it costs.
 
 ---
@@ -8,7 +8,7 @@ Each one says what was decided, why, and what it costs.
 
 ## Start here
 
-paved rests on a handful of decisions. The rest of this file explains them one at a time:
+Paved rests on a handful of decisions. The rest of this file explains them one at a time:
 
 | Decision | Where |
 |---|---|
@@ -674,7 +674,7 @@ drift put back.
 
 ---
 
-## ADR-024: paved is an operator, not a Helm chart
+## ADR-024: Paved is an operator, not a Helm chart
 
 **Status:** Accepted (Day 7, recording a choice made on Day 1)
 
@@ -684,7 +684,7 @@ controller. But the platform has to do things a chart can't do: keep the objects
 declared after they are created, report how each service is doing, and let live SLO data decide
 whether a release may ship.
 
-**Decision.** paved is a controller behind its own API, `ServiceClaim`:
+**Decision.** Paved is a controller behind its own API, `ServiceClaim`:
 - **It keeps objects the way they were declared.** A chart renders once, at install or upgrade.
   The controller sees a deleted or edited object and puts it back: on Day 7 a deleted
   PrometheusRule was back 100 to 257 ms after `kubectl delete` returned (README).
@@ -732,10 +732,10 @@ tokens.
   reachable from the internet. This deviates from the spec: without the Oracle move, the setup is a
   local cluster federated to AWS, not a cross-cloud one.
 - **ACK makes the AWS calls.**
-  - paved writes an ACK `Role` and `Bucket` for each claim with server-side apply, like every other
+  - Paved writes an ACK `Role` and `Bucket` for each claim with server-side apply, like every other
     object it manages (ADR-002).
   - ACK's IAM and S3 controllers create them in AWS and correct them there.
-  - The ACK controllers use the same federation, and paved itself holds no AWS permissions.
+  - The ACK controllers use the same federation, and Paved itself holds no AWS permissions.
 - **Scoped at every layer.**
   - A claim's role trusts only `system:serviceaccount:svc-<name>:<name>` with the STS audience, and
     its one inline policy names only its own bucket.
@@ -749,7 +749,7 @@ tokens.
   - Deleting a claim deletes its role but keeps its bucket (`services.k8s.aws/deletion-policy:
     retain`).
   - Both objects are `adopt-or-create`, so a rebuilt cluster takes back what an earlier one made.
-  - `spec.storage` can't change after creation, because paved never deletes objects it stops
+  - `spec.storage` can't change after creation, because Paved never deletes objects it stops
     building. Turning it off would leave a live role and bucket behind with no warning.
 - **Keys rotate with the cluster.** Every cluster-up publishes the new cluster's keys over the old
   ones, so tokens signed by a deleted cluster stop verifying.
@@ -760,7 +760,7 @@ tokens.
 - There are two more controllers to run and keep current (pinned in PROGRESS.md). A storage claim
   is Ready only once ACK reports both objects synced with AWS.
 - The IAM controller can write any trust policy on the roles it manages. The boundary limits what
-  such a role can do (objects in paved buckets), not who can assume it.
+  such a role can do (objects in `paved-*` buckets), not who can assume it.
 - Deleting the cluster without deleting storage claims first leaves their roles in AWS, until a
   rebuilt cluster adopts them or someone deletes them.
 - Kept buckets cost storage until their owner deletes them. `make aws-down` doesn't touch them.

@@ -1,10 +1,14 @@
-# paved
+# Paved
+
+**The SLO-driven golden path for Kubernetes.** One short `ServiceClaim` becomes a production-ready
+service: canary rollout, autoscaling, network policy, SLO alerts, dashboard and runbook. It stays that
+way, and deploys freeze when the error budget runs out.
 
 **Every team that ships a service to Kubernetes rebuilds the same production scaffolding by hand:
 resource limits, probes, autoscaling, a disruption budget, network policy, SLO alerts, a dashboard, a
 runbook, a canary. Each copy drifts, nobody measures whether the service is meeting its SLO, and
-nothing stops a team from shipping into an outage it is already having.** paved is an internal
-developer platform built as a Kubernetes operator. A team writes one short `ServiceClaim`; paved turns
+nothing stops a team from shipping into an outage it is already having.** Paved is an internal
+developer platform built as a Kubernetes operator. A team writes one short `ServiceClaim`; Paved turns
 it into all of that, keeps it that way, reads the service's error budget from Prometheus, freezes
 deploys when the budget is gone, and aborts a bad release halfway through its canary. With one more
 line, `storage: true`, it also gives the service an S3 bucket and an IAM role that only its own pods
@@ -93,14 +97,14 @@ comes back past 5%, and the same bump ships. [`demo/freeze-demo.sh`](demo/freeze
 
 [![Demo 2: a managed PrometheusRule is deleted and the controller recreates it](docs/casts/02-drift.gif)](demo/02-drift.cast)
 
-Someone deletes a PrometheusRule paved manages. The controller notices through its watch, applies it
+Someone deletes a PrometheusRule Paved manages. The controller notices through its watch, applies it
 again, and records a `DriftCorrected` Event on the claim. [`demo/02-drift.sh`](demo/02-drift.sh)
 
 ### 1. A second service is onboarded with one file
 
 [![Demo 1: the shortlink claim is written, committed and becomes a running, Ready service](docs/casts/01-onboard.gif)](demo/01-onboard.cast)
 
-The claim above is created, committed and pushed. Argo CD applies it, paved builds the service, and
+The claim above is created, committed and pushed. Argo CD applies it, Paved builds the service, and
 the claim reports `Ready=True`. The demo then lists what it became and follows a short link through
 it. [`demo/onboard-demo.sh`](demo/onboard-demo.sh)
 
@@ -121,7 +125,7 @@ Two teams add `storage: true` to their claims:
 - **ACK creates the AWS side.** It makes an IAM role and an S3 bucket for each claim, and both
   claims are Ready 16 seconds later.
 - **Each pod reaches only its own bucket.** A pod runs as one claim's service account, with exactly
-  the identity paved put in that claim's Rollout. It writes and reads its own bucket, and AWS
+  the identity Paved put in that claim's Rollout. It writes and reads its own bucket, and AWS
   refuses it the other claim's.
 - **No key is stored.** A scan of every Secret, ConfigMap and pod in the cluster finds no AWS key.
 - **Data outlives the claim.** Deleting a claim removes its role; its bucket, and the data in it,
@@ -143,7 +147,7 @@ Apple silicon); how each was taken is recorded in [PROGRESS.md](PROGRESS.md).
 | Storage for a claim | **16 s** from applying the claim to `StorageReady=True` and `Ready=True` | `demo/05-storage.sh` in the recording: the clock when the claims were applied, to the conditions' `lastTransitionTime`. The role was created, and the bucket, kept from an earlier run, adopted. |
 | A deleted claim's role | **Gone 49 s** after `kubectl delete`; IAM then answers `NoSuchEntity` | The same recording: the claim and its namespace gone, then `aws iam get-role`. The bucket is still there. |
 | AWS keys in the cluster | **0** in 26 Secrets, 76 ConfigMaps and 32 pods | The recording's scan: Secret values and Helm releases decoded, key IDs matched case-sensitively |
-| Canary abort | **62 s, 63 s, 63 s** (median 63 s) | From paved applying the bad image to the Rollout to the Rollout's `abortedAt`, in the recording and two more runs |
+| Canary abort | **62 s, 63 s, 63 s** (median 63 s) | From Paved applying the bad image to the Rollout to the Rollout's `abortedAt`, in the recording and two more runs |
 | Reconcile p95 | **494 ms** (median 192 ms) | `controller_runtime_reconcile_time_seconds` on the in-cluster controller: 95 reconciles over 10 minutes, covering three claims' one-minute refreshes, shortlink's onboarding and five drift restores; interpolated inside the 450 to 500 ms bucket |
 | Tests | **123**, all passing | `go test -v`: 92 Go tests (87 in the operator module, envtest included and the Kind e2e suite excluded, and 5 in `services/shortlink`) and 31 Ginkgo specs (11 controller, 12 webhook, and the 8 in `test/`) |
 
@@ -154,7 +158,7 @@ measured, what it promises and how far it scales. Everything else is the golden 
 every service, and not in the API at all
 ([ADR-001](DECISIONS.md#adr-001-developers-cannot-set-limits-security-context-rollout-strategy-probes-or-canary-steps)).
 
-| You can't set | paved decides | Why |
+| You can't set | Paved decides | Why |
 |---|---|---|
 | CPU and memory | Requests 50m and 64Mi, limits 250m and 128Mi | Capacity and cost stay predictable, and one noisy service can't starve its neighbours. A service that needs more is a platform change, made once. |
 | Security context | UID 65532, read-only root filesystem, no capabilities, `RuntimeDefault` seccomp | Every service gets the same baseline. An exception would be reviewed once, not rediscovered in each manifest. |
@@ -297,7 +301,7 @@ Buckets are kept by design, and yours to empty and delete.
   Its pods assume it with a projected token that AWS verifies against the cluster's public issuer,
   so no key exists to leak or rotate. Deleting the claim removes the role and keeps the bucket
   ([ADR-025](DECISIONS.md#adr-025-claims-get-storage-through-the-clusters-own-identity-with-no-aws-key-anywhere)).
-- **Why an operator at all.** A Helm chart renders once; paved keeps objects as declared, reports
+- **Why an operator at all.** A Helm chart renders once; Paved keeps objects as declared, reports
   status, and makes deploy decisions from live data
   ([ADR-024](DECISIONS.md#adr-024-paved-is-an-operator-not-a-helm-chart)).
 

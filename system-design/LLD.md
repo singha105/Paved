@@ -1,6 +1,6 @@
-# paved: low-level design
+# Paved: low-level design
 
-This document describes how each part of paved works, down to the fields, algorithms and settings in
+This document describes how each part of Paved works, down to the fields, algorithms and settings in
 the code. Read the [high-level design](HLD.md) first for the parts and how they fit together.
 Constants are quoted from the source. The worked numbers in section 7 come from the code's own
 formulas, not from measurement.
@@ -225,10 +225,10 @@ which isn't in this list; this open item is recorded in PROGRESS.md.
 ## 6. Apply and drift detection (`apply.go`, `drift.go`)
 
 For each object:
-1. **Convert it** to unstructured, dropping the fields a typed object always serialises but paved never
+1. **Convert it** to unstructured, dropping the fields a typed object always serialises but Paved never
    sets: `metadata.creationTimestamp`, the pod template's `creationTimestamp`, and `status`. Otherwise
-   paved would own them.
-2. **Read the live object** through the uncached reader. Keep paved's managed-fields entry: manager
+   Paved would own them.
+2. **Read the live object** through the uncached reader. Keep Paved's managed-fields entry: manager
    `paved-controller`, operation `Apply`, no subresource. `NotFound` means the object doesn't exist.
 3. **Server-side apply** with `client.ForceOwnership`. The response comes back into the same object.
 4. **Compare** the entry before and after, both its `fieldsV1` bytes and its `time`:
@@ -417,7 +417,7 @@ The first gate that fails decides the condition:
 
 ### Finalization
 
-For a claim with a deletion timestamp and paved's finalizer:
+For a claim with a deletion timestamp and Paved's finalizer:
 - **Namespace gone:** remove the finalizer.
 - **Namespace labelled as another claim's:** leave it, and remove the finalizer.
 - **Otherwise:** delete the namespace if it isn't already terminating, and requeue every 5 s.
@@ -541,7 +541,7 @@ sequenceDiagram
    anonymously over HTTPS.
 4. Install the platform stack, then the ACK IAM and S3 charts. Their values add `AWS_ROLE_ARN`,
    `AWS_WEB_IDENTITY_TOKEN_FILE` and the same projected token volume.
-5. Write `paved-aws`, and restart paved if it is already running.
+5. Write `paved-aws`, and restart Paved if it is already running.
 
 ## 13. Delivery
 
