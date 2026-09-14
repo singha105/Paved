@@ -63,7 +63,10 @@ state() {
 
 rollout_is_healthy_on() { [ "$(rollout '{.status.phase}')/$(rollout '{.spec.template.spec.containers[0].image}')" = "Healthy/$1" ]; }
 rollout_has_bad_image() { [ "$(rollout '{.spec.template.spec.containers[0].image}')" = "$BAD" ]; }
-sli_has_data() { [ "$(sli_5m)" != none ]; }
+# sli_is_clean: the rule returns a number below 0.01, not "none" (no series) or "nan" (no requests in
+# 5 minutes). Errors from an earlier bad release stay in the 5m window for 5 minutes, and would fail
+# the new canary's analysis before its own pods took any traffic.
+sli_is_clean() { awk -v ratio="$(sli_5m)" 'BEGIN { exit !(ratio != "none" && ratio != "nan" && ratio + 0 < 0.01) }'; }
 is_aborted() { [ "$(rollout '{.status.abort}')" = true ]; }
 only_stable_pods_serve() {
   [ -z "$(kubectl get pods -n "$ROLLOUT_NS" -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}' | grep -Fx "$BAD")" ]
@@ -135,7 +138,7 @@ say "Traffic: a steady trickle of requests for the whole demo"
     sleep 1
   done
 ) &
-wait_for "the 5m SLI, the rule the canary analysis reads, has data" 300 sli_has_data
+wait_for "the 5m SLI, the rule the canary analysis reads, has data and no recent errors" 900 sli_is_clean
 
 say "A bad release, 0.2.1-bad, fails every request. It ships like any release: as a commit to git"
 sed -i '' "s#image: $GOOD#image: $BAD#" "$CLAIM_FILE"
@@ -159,9 +162,11 @@ abort_seconds=$(python3 -c 'import sys; from datetime import datetime as d; p = 
 say "Aborted ${abort_seconds}s after the bad image reached the Rollout (applied $applied, aborted $aborted)"
 
 run kubectl argo rollouts get rollout "$CLAIM" -n "$ROLLOUT_NS"
-analysis_run=$(rollout '{.status.canary.currentBackgroundAnalysisRunStatus.name}')
-show "kubectl get analysisrun $analysis_run -n $ROLLOUT_NS -o jsonpath='{...measurements}'"
-kubectl get analysisrun "$analysis_run" -n "$ROLLOUT_NS" \
+# An aborted rollout no longer names its analysis run, so take the newest one.
+analysis_run=$(kubectl get analysisrun -n "$ROLLOUT_NS" --sort-by=.metadata.creationTimestamp -o name | tail -1)
+[ -n "$analysis_run" ] || fail "no AnalysisRun found in $ROLLOUT_NS"
+show "kubectl get $analysis_run -n $ROLLOUT_NS -o jsonpath='{.status.metricResults[*].measurements[*]}'"
+kubectl get "$analysis_run" -n "$ROLLOUT_NS" \
   -o jsonpath='{range .status.metricResults[*].measurements[*]}  {.finishedAt}  {.phase}  error ratio {.value}{"\n"}{end}'
 
 wait_for "the canary is scaled down and only 0.1.1 pods serve" 180 only_stable_pods_serve

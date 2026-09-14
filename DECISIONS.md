@@ -541,3 +541,106 @@ from image 0.1.1.
 - Each pod exposes a few more series.
 - A service that returns other codes must create those series too, or the first of each will be
   missed. The rules can't fix this: the missing increase never reaches Prometheus.
+
+---
+
+## ADR-021: CI scans the operator image before anything can publish it
+
+**Status:** Accepted (Day 6)
+
+**Context.** Argo CD deploys whatever image tag git names, so the pipeline that builds that image is
+the platform's front door. A vulnerable dependency is easy to miss: on Day 6 a local scan found two
+HIGH CVEs in `google.golang.org/grpc` 1.82.1 inside the controller binary, and nothing had flagged
+them. The scanner itself is a risk too: in March 2026 most of `aquasecurity/trivy-action`'s version
+tags were force-pushed to code that stole CI secrets (CVE-2026-33634).
+
+**Decision.**
+- `ci.yaml` replaces `test.yml` and runs, in order: `go vet`, `go test` for the packages that need no
+  API server, envtest (`make test`), `docker build`, a Trivy scan, and the push.
+- Trivy fails the run on any HIGH or CRITICAL vulnerability that has a fix. Unfixed ones are shown in
+  the report but don't fail it, because nothing in this repository could resolve them.
+- Only a push to main publishes, as `ghcr.io/singha105/paved:sha-<commit>` and `:main`. The pushed
+  image is the one that was scanned.
+- Every action is pinned to a full commit SHA; trivy-action is v0.36.0, released after the
+  compromise, with its own setup-trivy dependency also pinned by SHA.
+- The GHCR token reaches `docker login` through the environment and stdin, never interpolated into
+  a command.
+- `google.golang.org/grpc` moves to 1.83.2, which fixes both CVEs.
+- The branch `demo/trivy-catch` keeps a commit that builds on `alpine:3.14.0`, so the scan's failure
+  can be seen. It is never merged.
+
+**Consequences.**
+- A new CVE with a fix breaks main's next run until the dependency or base image is updated. That is
+  intended.
+- Branches and pull requests are scanned but publish nothing.
+- Updating a pinned action means looking up and checking its commit SHA by hand.
+
+---
+
+## ADR-022: The canary is gated on the same SLI recording rule as the alerts and the freeze
+
+**Status:** Accepted (Day 6)
+
+**Context.** Before Day 6 a Rollout moved through its canary steps on a timer. A release that failed
+every request would reach 100% as long as its pods passed their probes. The platform already
+measures each service's error ratio with recording rules that the burn-rate alerts (ADR-013) and the
+deploy freeze (ADR-017) read.
+
+**Decision.**
+- Every public and internal claim gets an AnalysisTemplate, `<name>-canary`, that queries the claim's
+  own 5m recording rule, `sli:http_availability:error_ratio_rate5m{service="<name>"}` (or the
+  `http_latency` one), every 30s.
+- A measurement fails when `len(result) > 0 && result[0] > 0.05`, and the first failure fails the
+  analysis. Argo Rollouts hands a Prometheus vector to the condition as a list, and an empty result,
+  from a service with no traffic, passes, as in ADR-014.
+- The Rollout runs it as background analysis from step 1, the first pause, once 20% of the replicas
+  run the new version, until the rollout completes. A failed analysis aborts the rollout: the canary
+  scales down and the stable version keeps serving.
+- The canary pauses grow from 30s to 2m. A bad version needs a scrape (30s), a rule evaluation (30s)
+  and a measurement (30s) before the analysis can see it, and a 30s pause would promote it first.
+- Batch claims get no analysis, since they have no traffic to measure.
+
+**Consequences.**
+- One SLI now has three jobs: it pages people (the burn-rate alerts), it stops shipping when the
+  budget is gone (the freeze), and it stops a bad release mid-rollout (this analysis). A change to how
+  a service is measured changes all three together.
+- Every canary takes at least 4 minutes.
+- Tiers are 13, 12 and 8 objects.
+- A Prometheus outage behaves differently here than in ADR-014. Query errors count against Argo
+  Rollouts' default `consecutiveErrorLimit` of 4, so an outage of about two minutes during a canary
+  aborts it. That is left at the default for now.
+- Changing the builders changes every claim's managed objects when a new controller version starts,
+  and drift detection (ADR-015) records those updates as `DriftCorrected` Events.
+
+---
+
+## ADR-023: Argo CD delivers the operator and the claims from git, as an app-of-apps
+
+**Status:** Accepted (Day 6)
+
+**Context.** Until Day 6 the operator reached the cluster through `make deploy` and the claims through
+`kubectl apply`, so what ran was whatever someone last applied from their machine. The platform
+should be delivered the way it delivers services: declared in git, applied by a controller, with
+drift put back.
+
+**Decision.**
+- `hack/cluster-up.sh` installs Argo CD (chart 10.9.0, v3.5.2, with dex and notifications off) and
+  applies one Application by hand: `deploy/argocd/root.yaml`. It syncs `deploy/argocd/apps`.
+- `paved-operator` renders `deploy/operator`: `config/default` with the image pinned to the GHCR tag
+  CI pushed. A new operator version is a commit that changes that tag. It runs in sync wave 0.
+- `platform-claims` applies `deploy/claims`: the namespace and every ServiceClaim. It runs in sync
+  wave 1.
+- Both use automated sync with prune and self-heal, server-side apply, and retries with backoff.
+  cert-manager's CA bundle in the webhook configuration is ignored.
+- The operator image lives on GHCR and is public, so the cluster needs no pull credentials.
+- The cluster can't receive GitHub webhooks, so the demos annotate the claims app with
+  `argocd.argoproj.io/refresh` to make it look at git immediately. Otherwise Argo CD polls.
+
+**Consequences.**
+- A claim changes by commit. A `kubectl edit` is undone by self-heal, which is why `freeze-demo.sh`
+  pauses automated sync while it patches the claim, and restores it on exit.
+- The freeze gates GitOps too. An image change synced while a claim is frozen is rejected by the
+  webhook, and the sync retries until the budget recovers or the commit adds a break-glass reason.
+- Rolling back a bad release means reverting its commit. Argo Rollouts already stopped the canary
+  (ADR-022), but git keeps asking for the bad image until the revert.
+- `make deploy` still works, but Argo CD replaces anything it applies with what git says.

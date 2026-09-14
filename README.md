@@ -36,6 +36,7 @@ namespace when the claim is deleted.
 | Object | public | internal | batch |
 |---|---|---|---|
 | Namespace, ServiceAccount, Argo Rollout (canary), NetworkPolicy | yes | yes | yes |
+| AnalysisTemplate: the SLI check that can abort a canary | yes | yes | no |
 | PrometheusRule: SLI recording rules and burn-rate alerts | yes | yes | yes |
 | ServiceMonitor, Grafana dashboard, runbook | yes | yes | yes |
 | Service, HorizontalPodAutoscaler, PodDisruptionBudget | yes | yes | no |
@@ -176,42 +177,81 @@ errors stop, the budget recovers, and the same release ships. Replay it with
 healthy at its current generation, so it is `False` during a canary
 ([ADR-019](DECISIONS.md#adr-019-ready-means-every-resource-is-applied-and-the-rollout-is-healthy)).
 
+## How releases ship
+
+The platform is delivered the same way it delivers services.
+
+**CI** ([`.github/workflows/ci.yaml`](.github/workflows/ci.yaml)) runs `go vet`, the unit tests and
+envtest, builds the operator image and scans it with Trivy. A HIGH or CRITICAL vulnerability that
+has a fix fails the run before anything is pushed, and only `main` publishes, to
+`ghcr.io/singha105/paved`
+([ADR-021](DECISIONS.md#adr-021-ci-scans-the-operator-image-before-anything-can-publish-it)). The
+branch [`demo/trivy-catch`](https://github.com/singha105/paved/tree/demo/trivy-catch) builds on
+`alpine:3.14.0` to show the gate working. Its
+[run failed at the Trivy step](https://github.com/singha105/paved/actions/runs/34807296384) with 38
+HIGH or CRITICAL vulnerabilities that have fixes (4 CRITICAL) and pushed nothing. Its parent
+commit, on main, [passed and published](https://github.com/singha105/paved/actions/runs/34807295309).
+
+**Argo CD** applies the platform from git as an app-of-apps
+([ADR-023](DECISIONS.md#adr-023-argo-cd-delivers-the-operator-and-the-claims-from-git-as-an-app-of-apps)).
+`deploy/argocd/root.yaml` creates two Applications: `paved-operator` runs the scanned image pinned in
+[`deploy/operator`](deploy/operator/kustomization.yaml), and `platform-claims` applies every claim in
+[`deploy/claims`](deploy/claims). A claim changes by commit, and Argo CD puts back any edit made with
+`kubectl`.
+
+**Argo Rollouts** ships each new image as a canary: 20% of the pods, a 2-minute pause, 50%, another
+2 minutes, then all of them. From the first pause, an AnalysisTemplate the controller generates for
+the claim reads `sli:http_availability:error_ratio_rate5m` every 30 seconds. The first reading above
+5% aborts the rollout, and the stable version keeps serving
+([ADR-022](DECISIONS.md#adr-022-the-canary-is-gated-on-the-same-sli-recording-rule-as-the-alerts-and-the-freeze)).
+
+That recording rule is the same one the burn-rate alerts and the deploy freeze read. **One SLI does
+three jobs:** it pages people when the error budget burns, it freezes deploys when the budget is
+gone, and it stops a bad release halfway through its canary. A service's measurement is defined
+once, so alerting, release policy and rollback can never disagree about whether it is healthy.
+
+[`demo/04-canary.cast`](demo/04-canary.cast) records a release that fails every request going out
+as a commit to `main`. Argo CD applies it, the canary starts, and the analysis aborts it with nobody
+touching the cluster. Reverting the commit brings the good version back. In the recording and two
+more runs on a local k3d cluster, the canary was aborted 62, 63 and 63 seconds after the bad image
+reached the Rollout, measured from paved's apply of the image to the Rollout's `abortedAt`. Each time
+the analysis passed its first two readings and failed the third, 60 seconds after it started.
+
 ## Run it locally
 
-Requires Docker, k3d, kubectl, Helm and Go, plus ApacheBench (`ab`) for the freeze demo. Versions
-used are pinned in [PROGRESS.md](PROGRESS.md).
+Requires Docker, k3d, kubectl, Helm and Go. The demos also need ApacheBench (`ab`) and the
+[`kubectl argo rollouts`](https://github.com/argoproj/argo-rollouts/releases/tag/v1.10.0) plugin.
+Versions used are pinned in [PROGRESS.md](PROGRESS.md).
 
 ```bash
-./hack/cluster-up.sh        # k3d cluster, registry on localhost:5001, platform stack
-./hack/testsvc-image.sh     # build and push the test service
-make docker-build deploy    # build the controller, load it into k3d, deploy it with its webhook
-```
-
-The controller runs in the cluster: the API server can only reach its admission webhook there, with
-the certificate cert-manager issues for it
-([ADR-016](DECISIONS.md#adr-016-the-controller-runs-in-the-cluster-and-make-docker-build-loads-it-into-k3d)).
-After rebuilding, restart it to pick up the new image:
-
-```bash
-kubectl rollout restart deployment/paved-controller-manager -n paved-system
-```
-
-Then create a claim:
-
-```bash
-kubectl apply -f examples/platform-claims-namespace.yaml
-kubectl apply -f examples/url-shortener.yaml
+./hack/cluster-up.sh        # k3d cluster, local registry, platform stack, Argo CD and its root app
+./hack/testsvc-image.sh     # build and push the test service the example claims run
+kubectl get applications -n argocd
 kubectl get serviceclaims -n platform-claims
 curl http://url-shortener.localhost/boom    # returns 500; counts against the SLO
 ```
 
-The freeze demo ships two more tags of the test service. Push them, then run it:
+Argo CD reads this repository on GitHub, so the cluster runs what is on `main`: the operator image
+CI published and the claims in [`deploy/claims`](deploy/claims). To change a claim, commit and push
+it. Argo CD checks git periodically; to make it check now:
+
+```bash
+kubectl annotate application platform-claims -n argocd argocd.argoproj.io/refresh=normal --overwrite
+```
+
+The demos ship more tags of the test service. Push them, then run either demo:
 
 ```bash
 TAG=0.1.2 ./hack/testsvc-image.sh
 TAG=0.2.0 ./hack/testsvc-image.sh
-./demo/freeze-demo.sh
+BROKEN=true TAG=0.2.1-bad ./hack/testsvc-image.sh
+./demo/freeze-demo.sh       # pauses Argo CD's automated sync while it patches the claim
+./demo/canary-demo.sh       # commits and pushes to main twice: the bad release, then its revert
 ```
+
+`make docker-build deploy` still builds a local controller into k3d and deploys it
+([ADR-016](DECISIONS.md#adr-016-the-controller-runs-in-the-cluster-and-make-docker-build-loads-it-into-k3d)),
+but Argo CD replaces it with the image pinned in git.
 
 `make run` starts the controller on your machine instead, without the webhook, so nothing enforces
 deploy freezes. It also can't reach Prometheus's in-cluster address; forward the port and point
@@ -228,13 +268,15 @@ ENABLE_WEBHOOKS=false go run ./cmd/main.go --prometheus-url=http://localhost:909
 ## Repository layout
 
 ```
+.github/workflows/   CI (tests, image build, Trivy scan, GHCR push), lint, e2e
 api/v1alpha1/        ServiceClaim types
 cmd/main.go          controller manager
 internal/builders/   one pure function per managed object
 internal/slo/        error budgets, recording rules, burn-rate alerts
 internal/controller/ reconciler: resources, drift, error budget, deploy freeze, Ready
 internal/webhook/    admission webhook: rejects image changes during a freeze, audits break-glass
-examples/            example claims and the test service
+deploy/              what Argo CD applies: the app-of-apps, the operator overlay, the claims
+examples/testsvc/    the test service the example claims run
 demo/                demo scripts and their asciinema recordings
 docs/runbooks/       runbooks the alerts link to
 hack/                cluster bootstrap and image scripts

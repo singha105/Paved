@@ -7,6 +7,7 @@
 | 3 | SLI recording rules, burn-rate alerts, dashboard | Done 2026-09-13 |
 | 4 | Error budget in status, drift correction | Done 2026-09-13 |
 | 5 | Admission webhook: freeze deploys on budget exhaustion | Done 2026-09-13 |
+| 6 | CI/CD, GitOps, image scanning, canary auto-rollback | Done 2026-09-14 |
 
 ## BLOCKED
 
@@ -33,6 +34,9 @@ for the rest of the build; change one only on purpose, and record why here.
 | kustomize | v5.8.1 | `KUSTOMIZE_VERSION` in `Makefile` |
 | setup-envtest | v0.25.0, serving Kubernetes 1.37.0 binaries | `make test` output |
 | golangci-lint | v2.13.1 | `GOLANGCI_LINT_VERSION` in `Makefile`; built with the logcheck plugin into `bin/` on Day 2 |
+| Trivy (local scans) | 0.74.0 | `trivy version` (Day 6) |
+| kubectl-argo-rollouts | v1.10.0+d90700a | GitHub release binary, SHA-256 checked against `argo-rollouts-checksums.txt`, in `~/.local/bin` (Day 6) |
+| gitleaks | 8.30.1 | `gitleaks version` |
 
 ### Go libraries (`go.mod`)
 
@@ -43,6 +47,7 @@ for the rest of the build; change one only on purpose, and record why here.
 | github.com/argoproj/argo-rollouts | v1.10.0 (Day 2; Rollout types, matching the installed controller) |
 | github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring | v0.93.1 (Day 2; API-only module, matching the installed operator) |
 | github.com/prometheus/client_golang | v1.24.0 (Day 2; demo app metrics, already a controller-runtime dependency) |
+| google.golang.org/grpc | v1.83.2 (Day 6; indirect, raised from v1.82.1 for CVE-2026-84304 and CVE-2026-84445) |
 
 Adding argo-rollouts raised the `go` directive in `go.mod` from 1.26.0 to 1.26.1, the minimum it
 declares. It pins `k8s.io/*` v0.34.5 in its own `go.mod`, but that doesn't apply to this module:
@@ -63,6 +68,15 @@ the build resolves v0.37.0 and pulls in no `k8s.io/kubernetes` packages.
 | traefik | traefik | traefik/traefik | 41.5.0 | traefik v3.7.13 |
 | argo-rollouts | argo-rollouts | argo/argo-rollouts | 2.43.1 | argo-rollouts v1.10.0 |
 | kps | monitoring | prometheus-community/kube-prometheus-stack | 90.1.2 | prometheus-operator v0.93.1, Prometheus v3.14.0, Alertmanager v0.34.0, Grafana 13.2.1, kube-state-metrics v2.20.0, node-exporter v1.12.1 |
+| argocd | argocd | argo/argo-cd | 10.9.0 | Argo CD v3.5.2 (Day 6; dex and notifications disabled) |
+
+### GitHub Actions (pinned by commit SHA, Day 6)
+
+| Action | Version | Commit |
+|---|---|---|
+| actions/checkout | v6.0.2 | `de0fac2e4500dabe0009e67214ff5f5447ce83dd` |
+| actions/setup-go | v6.3.0 | `4b73464bb391d4059bd26b0524d20df3927bd417` |
+| aquasecurity/trivy-action | v0.36.0, running Trivy v0.70.0 | `ed142fd0673e97e23eac54620cfb913e5ce36c25` (setup-trivy inside it pinned to `3fb12ec12f41e471780db15c232d5dd185dcb514`, v0.2.6) |
 
 ---
 
@@ -745,3 +759,157 @@ Extra checks beyond the acceptance list:
 - **Still open:** claim name and namespace validation, ingress TLS, the batch tier's ServiceMonitor,
   and the `platform-system` namespace that managed NetworkPolicies admit. The controller runs in
   `paved-system`, but it never calls the services, so nothing is blocked.
+
+---
+
+## Day 6: CI/CD, GitOps, image scanning, canary auto-rollback
+
+Agreed with the user before building (2026-09-14):
+- The cluster pulls the operator image from GHCR, public.
+- Demo 4 ships the bad image by committing it to main, and a second commit reverts it. Argo CD
+  self-heal is on, and `freeze-demo.sh` pauses the claims app's automated sync while it runs.
+- The vulnerable base image lives only on the branch `demo/trivy-catch`; main never carries it.
+- The canary pauses grow to 2 minutes, so the analysis can see a bad version before it is promoted.
+- The proposed defaults:
+  - grpc 1.83.2; `ci.yaml` replaces `test.yml`; every action pinned by SHA.
+  - Trivy fails on fixable HIGH and CRITICAL vulnerabilities; images publish only from main.
+  - Argo CD 10.9.0 without dex or notifications, an app-of-apps under `deploy/argocd`, and the claims
+    in `deploy/claims`.
+  - One AnalysisTemplate per public or internal claim, reading its 5m rule every 30 seconds and
+    failing on `len(result) > 0 && result[0] > 0.05`, run in the background from the first pause.
+  - The bad image is `testsvc:0.2.1-bad`; the rollouts plugin is v1.10.0.
+  - The abort time is measured in the recording and two more runs.
+
+### Acceptance
+
+Run on 2026-09-14 against the running cluster, with Argo CD delivering the operator and both
+claims. Output is copied from the terminal and shortened where marked.
+
+```text
+$ gh run list --limit 5
+completed	success	demo: revert url-shortener to 0.1.1 after its canary aborted	Lint	main	push	34811499912	1m16s	2026-09-14T05:57:23Z
+completed	success	demo: revert url-shortener to 0.1.1 after its canary aborted	CI	main	push	34811499907	3m44s	2026-09-14T05:57:23Z
+completed	success	demo: revert url-shortener to 0.1.1 after its canary aborted	E2E Tests	main	push	34811499891	4m31s	2026-09-14T05:57:23Z
+completed	success	demo: ship url-shortener 0.2.1-bad, a release that fails every request	E2E Tests	main	push	34811435274	4m44s	2026-09-14T05:56:15Z
+completed	success	demo: ship url-shortener 0.2.1-bad, a release that fails every request	CI	main	push	34811435272	3m40s	2026-09-14T05:56:15Z
+
+$ gh run list --branch demo/trivy-catch --limit 3
+completed	success	demo: build the operator on a vulnerable base image so Trivy fails CI	Lint	demo/trivy-catch	push	34807296381	3m51s	2026-09-14T04:46:56Z
+completed	failure	demo: build the operator on a vulnerable base image so Trivy fails CI	CI	demo/trivy-catch	push	34807296384	4m51s	2026-09-14T04:46:56Z
+completed	success	demo: build the operator on a vulnerable base image so Trivy fails CI	E2E Tests	demo/trivy-catch	push	34807296426	6m31s	2026-09-14T04:46:56Z
+(none of the last 40 runs on main has a conclusion other than success)
+
+$ kubectl get applications -n argocd
+NAME              SYNC STATUS   HEALTH STATUS
+paved             Synced        Healthy
+paved-operator    Synced        Healthy
+platform-claims   Synced        Healthy
+
+$ kubectl argo rollouts get rollout url-shortener -n svc-url-shortener --watch
+(captured through the third measurement run of canary-demo.sh; each status change, in order)
+Status:          ✔ Healthy
+Status:          ◌ Progressing
+Message:         more replicas need to be updated
+Status:          ॥ Paused
+Message:         CanaryPauseStep
+Status:          ✖ Degraded
+Message:         RolloutAborted: Rollout aborted update to revision 23: Background analysis phase error/failed: Metric "sli-error-ratio" assessed Failed due to failed (1) > failureLimit (0)
+Status:          ◌ Progressing
+Message:         waiting for rollout spec update to be observed
+Status:          ✔ Healthy
+
+# The same run, from canary-demo.sh: the analysis readings and the abort time
+  2026-09-14T05:56:18Z  Successful  error ratio [0]
+  2026-09-14T05:56:48Z  Successful  error ratio [0]
+  2026-09-14T05:57:18Z  Failed  error ratio [0.05110782034319856]
+# Aborted 63s after the bad image reached the Rollout (applied 2026-09-14T05:56:15Z, aborted 2026-09-14T05:57:18Z)
+
+$ kubectl get serviceclaims -A
+NAMESPACE         NAME               TIER     OWNER               BUDGET   FROZEN   READY   AGE
+platform-claims   url-shortener      public   team-links          28.1%    False    True    24h
+platform-claims   webhook-delivery   public   team-integrations   100.0%   False    True    24h
+```
+
+The rollback to stable was automatic. At the abort, Argo Rollouts scaled the canary to zero, and in the
+recording `kubectl get pods` then listed only the two 0.1.1 pods, before anyone reverted anything. The
+last `Progressing` and `Healthy` came after the demo's revert commit made git agree with the cluster
+again.
+
+Extra checks beyond the acceptance list:
+
+- **main would have failed its own scan.** Trivy on the Day 5 controller image found 2 HIGH
+  vulnerabilities in `google.golang.org/grpc` 1.82.1 (CVE-2026-84304 and CVE-2026-84445). After the
+  bump to 1.83.2 it found none, in the Debian packages or the Go binary.
+- **The catch fails exactly at the scan.** On `demo/trivy-catch`, CI run 34807296384 passed every
+  step up to "Scan the image with Trivy", which failed with `Total: 38 (HIGH: 34, CRITICAL: 4)` for
+  `alpine 3.14.0`; "Push to GHCR" was skipped. Its parent on main, run 34807295309, passed every step
+  including the push.
+- **The published image is public.** With an anonymous GHCR token, the manifests of `sha-0d60c3c`
+  and `sha-8d12dc8` returned HTTP 200. Nothing was changed in the package settings.
+- **The analysis objects are what the builder says.** `kubectl get analysistemplates -A` listed
+  `url-shortener-canary` and `webhook-delivery-canary`, with failure condition
+  `len(result) > 0 && result[0] > 0.05` and query
+  `sli:http_availability:error_ratio_rate5m{service="url-shortener"}`. The Rollout carried
+  `analysis={"startingStep":1,"templates":[{"templateName":"url-shortener-canary"}]}` and pauses of `2m`.
+- **The analysis lets a good release through.** When Argo CD first set url-shortener back to 0.1.1,
+  the canary finished `Healthy` and AnalysisRun `url-shortener-95d6ffc94-14` was `Successful` after 9
+  measurements. All 9 were `NaN`, because nothing was sending traffic, and no data passes by design.
+- **Argo CD took over the running operator.** About 32 seconds after `kubectl apply -f
+  deploy/argocd/root.yaml`, all three Applications were `Synced` and `Healthy`, and the controller
+  Deployment ran `ghcr.io/singha105/paved:sha-8d12dc8`.
+- **The bad image deploys cleanly and then fails.** Run locally, `testsvc:0.2.1-bad` answered HTTP 500
+  on `/` and HTTP 200 on `/healthz`, `/readyz` and `/metrics`, and logged `broken=true`.
+
+### Measurements
+
+| What | Value | How measured |
+|---|---|---|
+| Canary abort time | 62 s in the recording, 63 s and 63 s in two more runs (median 63 s). A first attempt, whose revert step failed, measured 70 s. One run that aborted after 5 s, on errors left from an earlier run, is excluded | From the time paved's server-side apply put the bad image on the Rollout (its `managedFields` entry) to the Rollout's `status.abortedAt` |
+| Argo CD memory | 126 MiB across its five pods, just after install | `kubectl top pods -n argocd` |
+| `demo/04-canary.cast` | 217 s recorded, about 23 s of playback | Sum of the cast's event intervals, uncapped and capped at the 2 s idle limit |
+| url-shortener error budget spent by five bad canaries | 38.5% remaining before, 28.1% after | `kubectl get serviceclaims` |
+| Statement coverage | builders 90.7%, controller 89.1%, slo 93.0%, webhook 95.1% | `make test` |
+
+### Deviations from the spec
+
+- **The claims moved to `deploy/claims` in the analysis commit (8d12dc8), not the GitOps commit.** The
+  rename was already staged when that commit was made, and it had been pushed before this was
+  noticed, so history was not rewritten.
+- **The failure condition is `len(result) > 0 && result[0] > 0.05`, not `result > 0.05`.** Argo
+  Rollouts hands a Prometheus vector to the condition as a list, and an empty result has to pass
+  rather than error.
+- **`ci.yaml` runs envtest through `make test`**, which also reruns `go vet` and the unit tests.
+- **main has no revert commit for the Trivy catch**, because main never carried the vulnerable base
+  image (agreed). The branch stays pushed so its failed run can be linked.
+- **Each `canary-demo.sh` run adds two commits to main**, the bad image and its revert (agreed).
+- **The first two recording attempts left extra demo commits on main.** The first stopped after the
+  abort, when it looked up the AnalysisRun by the name an aborted Rollout no longer reports, so its
+  revert (aac8186) was committed by hand. The second aborted 5 seconds in, because errors from the
+  first attempt were still inside the 5-minute window when its canary began. That is not a
+  measurement of the new release, so it is excluded, and the script now finds the newest AnalysisRun
+  and waits for the 5m error ratio to fall below 0.01 before shipping.
+
+### Notes for later days
+
+- **Disk and Docker failed mid-day.** The Mac's disk filled to 128 MiB free, Docker's VM went
+  read-only, and k3s answered writes with `attempt to write a readonly database`. It was fixed by
+  clearing the Go build cache (with the user's OK) and the Trivy cache, and restarting Docker Desktop.
+  Later, during the first demo 4 attempt, Docker Desktop's engine stopped answering: every API call
+  returned HTTP 500. After the user's interruption Docker was started again, and the cluster came back
+  with its data, Prometheus's history included. The cause of the second failure was not established.
+- **The `gvenzl/oracle-xe` images (14.6 GB) are still there.** Deleting them was blocked by the
+  permission check.
+- **A controller upgrade that changes the builders is reported as drift.** When the analysis builder
+  was deployed, both claims got `DriftCorrected` Events for their Rollouts, because paved's own field
+  set changed (ADR-015). Telling an upgrade from an edit needs more design.
+- **A Prometheus outage can abort a canary.** Query errors count against Argo Rollouts' default
+  `consecutiveErrorLimit` of 4, the opposite of the fail-open rule in ADR-014 (ADR-022).
+- **Canary failures spend the claim's error budget.** With about 1.48 million requests of history,
+  url-shortener had room for roughly 2,800 more failures, which is why `canary-demo.sh` sends only
+  about 10 requests a second. A claim with little history could freeze itself during its own bad
+  canary, and then the revert commit is rejected until the budget recovers or it adds a break-glass
+  reason.
+- **The cluster can't receive GitHub webhooks.** Argo CD polls git, and the demos annotate the claims
+  app to make it check immediately.
+- Still open from earlier days: claim name and namespace validation, ingress TLS, the batch tier's
+  ServiceMonitor, and the `platform-system` namespace in managed NetworkPolicies.
