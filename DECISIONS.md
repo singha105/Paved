@@ -19,6 +19,7 @@ paved rests on a handful of decisions. The rest of this file explains them one a
 | Freeze at an empty budget, unfreeze only at 5% | [ADR-017](#adr-017-deploys-freeze-when-the-budget-is-gone-and-unfreeze-only-at-5) |
 | Break-glass instead of a hard block | [ADR-018](#adr-018-the-webhook-rejects-only-image-changes-and-break-glass-must-be-set-in-the-same-update) |
 | One SLI for alerts, the freeze and the canary | [ADR-022](#adr-022-the-canary-is-gated-on-the-same-sli-recording-rule-as-the-alerts-and-the-freeze) |
+| Storage through the cluster's own identity, with no AWS key anywhere | [ADR-025](#adr-025-claims-get-storage-through-the-clusters-own-identity-with-no-aws-key-anywhere) |
 
 ---
 
@@ -705,3 +706,63 @@ whether a release may ship.
   gate on the operator's own consumers limit the damage, but don't remove it.
 - Helm is still used where rendering once is right: `hack/cluster-up.sh` installs cert-manager,
   Traefik, Argo Rollouts, kube-prometheus-stack and Argo CD with it.
+
+## ADR-025: Claims get storage through the cluster's own identity, with no AWS key anywhere
+
+**Status:** Accepted (Day 8, optional)
+
+**Context.** Day 8 asked for an S3 bucket and a scoped IAM role for each claim with
+`spec.storage: true`, with no long-lived credentials anywhere. The spec proposed moving the cluster
+to an Oracle Cloud always-free ARM instance with a public OIDC issuer, federated to AWS IAM. There
+was no Oracle Cloud account to use, so the cluster stays on k3d. AWS doesn't need a public cluster
+to trust one, only a public issuer: the discovery document and the keys that verify the cluster's
+tokens.
+
+**Decision.**
+- **Federation, not keys.**
+  - The k3s API server issues service-account tokens as
+    `https://<issuer bucket>.s3.<region>.amazonaws.com`.
+  - The discovery document and the signing keys (JWKS) are the only public objects in that bucket.
+  - An IAM OIDC provider trusts that issuer. IAM reads the discovery document when it creates the
+    provider, before any cluster exists, so Terraform first uploads placeholders that name the issuer
+    with an empty key set. cluster-up overwrites both.
+  - A pod hands AWS STS a projected token with the audience `sts.amazonaws.com`
+    (`AssumeRoleWithWebIdentity`) and gets a session that expires.
+- **The cluster stays private.** Only the two documents are public, and the API server isn't
+  reachable from the internet. This deviates from the spec: without the Oracle move, the setup is a
+  local cluster federated to AWS, not a cross-cloud one.
+- **ACK makes the AWS calls.**
+  - paved writes an ACK `Role` and `Bucket` for each claim with server-side apply, like every other
+    object it manages (ADR-002).
+  - ACK's IAM and S3 controllers create them in AWS and correct them there.
+  - The ACK controllers use the same federation, and paved itself holds no AWS permissions.
+- **Scoped at every layer.**
+  - A claim's role trusts only `system:serviceaccount:svc-<name>:<name>` with the STS audience, and
+    its one inline policy names only its own bucket.
+  - A permissions boundary caps every such role to objects in `paved-*` buckets, and denies the
+    issuer bucket.
+  - The IAM controller can create roles only under `/paved/workloads/`, only with that boundary,
+    and can't remove the boundary.
+  - The S3 controller can change the settings of `paved-*` buckets. It is denied their object data
+    and the issuer bucket.
+- **Data outlives YAML.**
+  - Deleting a claim deletes its role but keeps its bucket (`services.k8s.aws/deletion-policy:
+    retain`).
+  - Both objects are `adopt-or-create`, so a rebuilt cluster takes back what an earlier one made.
+  - `spec.storage` can't change after creation, because paved never deletes objects it stops
+    building. Turning it off would leave a live role and bucket behind with no warning.
+- **Keys rotate with the cluster.** Every cluster-up publishes the new cluster's keys over the old
+  ones, so tokens signed by a deleted cluster stop verifying.
+- **Short-lived on the laptop too.** `hack/aws-up.sh` refuses a profile that stores an access key,
+  and runs on an `aws login` session instead.
+
+**Consequences.**
+- There are two more controllers to run and keep current (pinned in PROGRESS.md). A storage claim
+  is Ready only once ACK reports both objects synced with AWS.
+- The IAM controller can write any trust policy on the roles it manages. The boundary limits what
+  such a role can do (objects in paved buckets), not who can assume it.
+- Deleting the cluster without deleting storage claims first leaves their roles in AWS, until a
+  rebuilt cluster adopts them or someone deletes them.
+- Kept buckets cost storage until their owner deletes them. `make aws-down` doesn't touch them.
+- Storage needs the AWS link. Without it, `make demo` works as before, and a storage claim reports
+  `StorageUnavailable`.

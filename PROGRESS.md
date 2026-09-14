@@ -9,6 +9,7 @@
 | 5 | Admission webhook: freeze deploys on budget exhaustion | Done 2026-09-13 |
 | 6 | CI/CD, GitOps, image scanning, canary auto-rollback | Done 2026-09-14 |
 | 7 | envtest suite, second service, documentation | Done 2026-09-14 |
+| 8 | (Optional) workload identity: per-claim IAM role and S3 bucket, no AWS keys | Done 2026-09-14 |
 
 ## BLOCKED
 
@@ -38,6 +39,10 @@ for the rest of the build; change one only on purpose, and record why here.
 | Trivy (local scans) | 0.74.0 | `trivy version` (Day 6) |
 | kubectl-argo-rollouts | v1.10.0+d90700a | GitHub release binary, SHA-256 checked against `argo-rollouts-checksums.txt`, in `~/.local/bin` (Day 6) |
 | gitleaks | 8.30.1 | `gitleaks version` |
+| Terraform | v1.16.0 | `terraform version` (Day 8; hand-installed in `~/.local/bin`) |
+| Terraform AWS provider | hashicorp/aws 6.64.0 | Latest on the registry on 2026-09-14; locked in `infra/aws/.terraform.lock.hcl` (Day 8) |
+| AWS CLI | 2.35.11 (Homebrew, first on `PATH`) | `aws --version` (Day 8). `/usr/local/bin/aws` 2.36.24 is also installed; the scripts use whichever comes first |
+| AWS CLI image for the storage proof | `amazon/aws-cli:2.36.44` (amd64 and arm64) | Newest tag on Docker Hub on 2026-09-14, platforms from `docker buildx imagetools inspect` (Day 8) |
 
 ### Go libraries (`go.mod`)
 
@@ -70,6 +75,8 @@ the build resolves v0.37.0 and pulls in no `k8s.io/kubernetes` packages.
 | argo-rollouts | argo-rollouts | argo/argo-rollouts | 2.43.1 | argo-rollouts v1.10.0 |
 | kps | monitoring | prometheus-community/kube-prometheus-stack | 90.1.2 | prometheus-operator v0.93.1, Prometheus v3.14.0, Alertmanager v0.34.0, Grafana 13.2.1, kube-state-metrics v2.20.0, node-exporter v1.12.1 |
 | argocd | argocd | argo/argo-cd | 10.9.0 | Argo CD v3.5.2 (Day 6; dex and notifications disabled) |
+| ack-iam-controller | ack-system | oci://public.ecr.aws/aws-controllers-k8s/iam-chart | 1.9.0 | iam-controller 1.9.0, ACK runtime v0.63.0 (Day 8; only with `PAVED_AWS_PROFILE`) |
+| ack-s3-controller | ack-system | oci://public.ecr.aws/aws-controllers-k8s/s3-chart | 1.12.1 | s3-controller 1.12.1 (Day 8; only with `PAVED_AWS_PROFILE`) |
 
 ### GitHub Actions (pinned by commit SHA, Day 6)
 
@@ -1081,3 +1088,218 @@ Extra checks beyond the acceptance list:
   172.19.0.4), and then came up on its own.
 - **`Ready` drops to False while an autoscaler adds pods.** A new claim's Rollout starts with one pod; the HPA then scales it to its minimum, and Argo Rollouts reports `Progressing` until the new pod is ready. shortlink did this at the end of the clean-clone `make demo`. ADR-019 defines `Ready` as a healthy Rollout, so this follows the definition, but a scale event making a claim unready is worth revisiting.
 - **`demo/onboard-demo.sh` and `demo/canary-demo.sh` push to main.** From a clone, run them on a fork.
+
+---
+
+## Day 8 (optional): workload identity federation to AWS
+
+Agreed with the user before building (2026-09-14):
+- **No Oracle Cloud.**
+  - The user has an AWS account only, so the cluster stays on local k3d.
+  - Only its service-account issuer goes public: the discovery document and signing keys, as objects
+    in an S3 bucket.
+  - The spec's move to an always-free ARM instance, and with it the cross-cloud framing, is dropped
+    (see the deviations below).
+- **ACK makes the AWS calls.** The ACK iam-controller (1.9.0) and s3-controller (1.12.1) do them; paved
+  applies ACK `Role` and `Bucket` objects with server-side apply, like everything else it manages.
+- **Short-lived login only.**
+  - AWS is reached through `aws login --profile paved`.
+  - The `default` profile's static keys are never used.
+  - `hack/aws-up.sh` refuses any profile that stores an access key.
+- **Terraform in `infra/aws`**, run by `make aws-up` and `make aws-down`. The issuer documents live in
+  a public-read S3 bucket.
+- **Two demo-only storage claims**, applied with kubectl by `demo/05-storage.sh`. `deploy/claims`
+  doesn't change.
+- **`spec.storage` is fixed at creation** (CEL), because paved never deletes objects it stops building.
+- The proposed defaults:
+  - Storage is opt-in with `PAVED_AWS_PROFILE`, and every cluster-up republishes the signing keys.
+  - The region is eu-west-2.
+  - Each claim's role:
+    - trusts only the claim's service account, with the `sts.amazonaws.com` audience
+    - sits under a permissions boundary
+    - has an inline policy for its own bucket only
+  - The bucket is `paved-<name>-<hash>`, with every kind of public access blocked. It is kept when
+    the claim is deleted.
+  - Both objects are `adopt-or-create`.
+  - A `StorageReady` condition and `status.storage` report the result.
+  - ACK objects are built as unstructured, so there's no new Go dependency.
+  - A storage claim's name has at most 48 characters.
+  - The AWS settings live in a `paved-aws` ConfigMap, never in git.
+  - Commits are pushed as work lands.
+  - The paved cluster is deleted and rebuilt with the AWS link.
+
+### Acceptance
+
+Run on 2026-09-14. Output is copied from the terminal and shortened where marked. The AWS account ID
+is replaced with `<account>`.
+
+```text
+$ make test
+ok  	github.com/singha105/paved/examples/testsvc	(cached)	coverage: 37.9% of statements
+ok  	github.com/singha105/paved/internal/builders	1.193s	coverage: 91.8% of statements
+ok  	github.com/singha105/paved/internal/controller	8.993s	coverage: 86.6% of statements
+ok  	github.com/singha105/paved/internal/slo	(cached)	coverage: 93.0% of statements
+ok  	github.com/singha105/paved/internal/webhook/v1alpha1	7.772s	coverage: 95.1% of statements
+ok  	github.com/singha105/paved/test	16.695s	coverage: [no statements]
+$ make lint
+0 issues.
+
+# The two new envtest specs, beside the six from Day 7
+ServiceClaim controller storage: builds a Role only its service account can assume and a kept Bucket, then waits for ACK
+ServiceClaim controller storage: can't be switched on after creation, and a storage claim's name must fit a bucket name
+Ran 8 of 8 Specs
+
+# The cluster was deleted and rebuilt, linked to AWS (the registry and its images kept)
+$ k3d cluster delete paved
+$ PAVED_AWS_PROFILE=paved make demo
+==> Linking the cluster to AWS with profile 'paved' (hack/aws-up.sh)
+==> Creating cluster 'paved' (rancher/k3s:v1.36.4-k3s1)
+==> Publishing the cluster's issuer documents to https://paved-oidc-89acfb0e43f2.s3.eu-west-2.amazonaws.com
+(Helm output for the platform stack and the two ACK charts left out)
+==> Writing paved's AWS settings (ConfigMap paved-system/paved-aws)
+==> paved is up, in 252s
+paved             Synced        Healthy
+paved-operator    Synced        Healthy
+platform-claims   Synced        Healthy
+shortlink          internal   team-growth                  False    True    16s
+url-shortener      public     team-links                   False    True    16s
+webhook-delivery   public     team-integrations            False    True    16s
+make demo exit=0 after 253s
+
+$ kubectl -n paved-system logs deploy/paved-controller-manager | grep 'Storage is'
+Storage is on	{"region": "eu-west-2", "issuer": "paved-oidc-89acfb0e43f2.s3.eu-west-2.amazonaws.com"}
+
+# The API server signs as the public issuer, and only the two documents are public
+$ kubectl get --raw /.well-known/openid-configuration
+{"issuer":"https://paved-oidc-89acfb0e43f2.s3.eu-west-2.amazonaws.com","jwks_uri":"https://paved-oidc-89acfb0e43f2.s3.eu-west-2.amazonaws.com/openid/v1/jwks","response_types_supported":["id_token"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["RS256"]}
+a token for sts.amazonaws.com, claims only: {"iss": "https://paved-oidc-89acfb0e43f2.s3.eu-west-2.amazonaws.com", "aud": ["sts.amazonaws.com"], "sub": "system:serviceaccount:default:default"}
+JWKS, cluster vs anonymous HTTPS from S3: identical
+anonymous GET of the bucket listing: HTTP 403
+
+# AWS STS accepts a cluster token only for the right service account and audience
+token for ack-system:ack-iam-controller, audience sts.amazonaws.com, its own role:
+arn:aws:sts::<account>:assumed-role/paved-ack-iam-controller/paved-proof
+token for ack-system:ack-s3-controller, the IAM controller's role:
+An error occurred (AccessDenied) when calling the AssumeRoleWithWebIdentity operation: Not authorized to perform sts:AssumeRoleWithWebIdentity
+token for ack-iam-controller with the default k3s audiences:
+An error occurred (InvalidIdentityToken) when calling the AssumeRoleWithWebIdentity operation: Token audience contains more than one audience while authorized party is not present
+
+$ PAVED_AWS_PROFILE=paved ./demo/05-storage.sh   (recorded as demo/05-storage.cast; shortened)
+# invoices: StorageReady 16s and Ready 16s after the claims were applied
+$ aws iam get-role --role-name paved-invoices
+arn:       arn:aws:iam::<account>:role/paved/workloads/paved-invoices
+boundary:  arn:aws:iam::<account>:policy/paved/paved-workload-boundary
+trusts:    arn:aws:iam::<account>:oidc-provider/paved-oidc-89acfb0e43f2.s3.eu-west-2.amazonaws.com
+  only if  aud = sts.amazonaws.com
+  only if  sub = system:serviceaccount:svc-invoices:invoices
+$ aws s3api get-public-access-block --bucket paved-invoices-42250471 --query PublicAccessBlockConfiguration --output text
+True	True	True	True
+$ kubectl get pod storage-proof -n svc-invoices -o jsonpath='{.spec.containers[0].env[*].name}'
+AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_REGION AWS_DEFAULT_REGION PAVED_STORAGE_BUCKET OTHER_BUCKET HOME
+$ kubectl logs storage-proof -n svc-invoices
+I am:    arn:aws:sts::<account>:assumed-role/paved-invoices/botocore-session-1789422689
+wrote:   s3://paved-invoices-42250471/proof.txt
+read:    written by invoices at 2026-09-14T21:51:30Z
+list    s3://paved-avatars-5dcf5e7e: AccessDenied
+write   s3://paved-avatars-5dcf5e7e: AccessDenied
+$ kubectl get secrets,configmaps,pods -A -o json | ./scan-for-aws-keys
+  ConfigMaps  scanned   76
+  Pods        scanned   32
+  Secrets     scanned   26
+  AWS keys found: 0
+$ kubectl delete serviceclaim invoices -n platform-claims --wait=false
+$ aws iam get-role --role-name paved-invoices
+NoSuchEntity: the role is gone
+$ aws s3 ls s3://paved-invoices-42250471/
+2026-09-14 17:51:32         44 proof.txt
+storage_ready_seconds=16 ready_seconds=16 claim_deleted_seconds=49 kept_buckets=paved-invoices-42250471,paved-avatars-5dcf5e7e
+
+# The account ID, read from `aws sts get-caller-identity`, searched for before committing
+$ grep -rIl "$ACCOUNT_ID" --exclude-dir=.git --exclude-dir=.terraform --exclude="*.tfstate*" .
+(no matches)
+$ git log -p --all | grep -c "$ACCOUNT_ID"
+0
+```
+
+### Measurements
+
+| What | Value | How measured |
+|---|---|---|
+| Storage for a claim | 16 s to `StorageReady=True` and `Ready=True` | `demo/05-storage.sh` in the recording: the local clock when the claims were applied, to the conditions' `lastTransitionTime`. The role was created; the bucket, kept from the rehearsal, was adopted, so this isn't a from-scratch bucket creation. |
+| A deleted claim's role | Gone 49 s after `kubectl delete`, then `NoSuchEntity` | The same recording: the claim, its namespace and its ACK objects gone, then `aws iam get-role` |
+| AWS keys in the cluster | 0 in 26 Secrets, 76 ConfigMaps and 32 pods | The recording's scan, which decodes Secret values and Helm releases and matches key IDs case-sensitively |
+| `make demo` linked to AWS | 253 s, exit 0 | Wall clock, with the cluster deleted and the registry kept. It was the second attempt: the first stopped after 14 s at the OIDC provider (notes). |
+| Tests | 123: 92 Go tests (87 in the operator module, 5 in shortlink) and 31 Ginkgo specs (11 controller, 12 webhook, 8 in `test/`), 0 failures | `go test -v`, counting top-level `--- PASS: Test` lines without the three Ginkgo suite wrappers, plus `Ran N of N Specs` |
+| Node memory with AWS on | k3s server container 3.48 GiB of 4.8 GiB, swap 1023 of 1024 MiB, CPU 268% | `docker stats` and `free -m` in the container during the rehearsal |
+| Rehearsal claims deleted | 133 s under that load; 46 s for the stopped recording's claims, with Grafana paused | Wall clock of `kubectl delete --wait` |
+| Demo GIF | 05 1.8 MB | `agg --idle-time-limit 2 --last-frame-duration 5` |
+
+### Deviations from the spec
+
+- **The cluster didn't move to Oracle Cloud (agreed).** The user has no OCI account, so the cluster
+  stays on k3d. Only its issuer is public, as two objects in an S3 bucket. The result is workload
+  identity federation from a local cluster to AWS, not a cross-cloud setup. The API server isn't
+  exposed.
+- **The AWS login was as the root user.** It is a short-lived `aws login` session with no stored key,
+  so the "no long-lived credentials" requirement holds, but an admin IAM user would be the right
+  identity.
+- **Commit 3 was pushed before the live run, with three defects the run then found.**
+  - The OIDC provider couldn't be created before any issuer document existed.
+  - Two ACK permissions were missing.
+  - `aws s3 cp` had no region.
+
+  The fixes are in commit 4. Between the two commits, `infra/aws` on main couldn't complete an apply.
+- **The first recording hung,** on the AWS CLI pager inside asciinema's terminal. It was stopped, its
+  two claims were deleted (roles removed, buckets kept), the pager was turned off, and the demo was
+  recorded again. The progress line now reads each claim's conditions in one call. Before, it could
+  pair a new status with an old reason, and showed `StorageReady=False Provisioned`.
+- **Grafana was scaled to 0 for the recording and back to 1 afterwards (agreed),** because the node
+  was out of memory.
+- **The recording's AWS account ID is redacted.** The 4 occurrences in the cast became `<account-id>`
+  before it was committed.
+- **The demo's claims are applied with kubectl, not git (agreed).** Argo CD doesn't track them, and the
+  demo deletes them.
+
+### Notes for later days
+
+- **IAM validates the discovery document when the OIDC provider is created.**
+  - The first `make demo` with AWS stopped at `CreateOpenIDConnectProvider`: `InvalidInput: Please
+    check .well-known/openid-configuration of provider ... is valid`. No cluster existed yet to
+    publish the document.
+  - `infra/aws` now uploads placeholder issuer documents first, and cluster-up replaces them with
+    the cluster's.
+  - `ignore_changes` keeps Terraform from putting the placeholders back. After a later
+    `terraform apply`, the public signing keys were still the cluster's, and a new plan showed no
+    changes.
+- **IAM checks a lookup of a role that doesn't exist yet against `role/<name>`, without the path.**
+  - ACK's `iam:GetRole`, before `CreateRole`, was denied "on resource: role paved-invoices" while the
+    policy allowed only `role/paved/workloads/*`.
+  - The IAM controller may now look up `role/paved-*` by name.
+  - Its own roles, under `/paved/controllers/`, are denied explicitly.
+- **s3-controller 1.12.1 tags buckets with `s3:TagResource`,** which `s3:Put*` doesn't cover. The
+  S3 controller's policy now allows `TagResource` and `UntagResource` on `paved-*` buckets.
+- **ACK backs off after AccessDenied.** After the policies were fixed, the objects synced within
+  minutes; restarting the two ACK controllers made them retry at once.
+- **`aws login` doesn't save a region**, and even IAM calls on the session fail with `NoRegion`
+  without one. cluster-up and the demo pass the region explicitly.
+- **The login was as the account's root user.** It is a short-lived session with no stored key, so no
+  long-lived credential exists, but root can do far more than this needs. An admin IAM user, or IAM
+  Identity Center, would be better.
+- **STS rejects the k3s default token audiences** ("Token audience contains more than one audience"),
+  so a pod needs a projected token whose only audience is `sts.amazonaws.com`. That is what paved
+  injects.
+- **With the AWS link, the single k3d node is at its memory limit.**
+  - The k3s server container used 3.48 GiB of the Docker VM's 4.8 GiB, with its 1 GiB swap full and
+    CPU at 268%.
+  - The API server slowed: paved lost its leader-election lease (`context deadline exceeded`) and
+    restarted at 21:35:01Z, and the ACK controllers failed probes.
+  - Nothing was lost, since leadership comes back on restart, but timings taken under that load
+    aren't representative.
+- **The key scan's first version reported a false positive.**
+  - It matched key IDs case-insensitively, so `(AKIA|ASIA)[A-Z0-9]{16}` found 20 mixed-case characters
+    inside cert-manager's still-encoded Helm release Secret. Decoded, that release has 2,796,733
+    characters, no AWS key ID and no `aws_secret_access_key`.
+  - The scan now matches key IDs case-sensitively, with bounds on both sides, and decompresses Helm
+    releases before searching.
+  - Four controls check it: clean input passes, a mixed-case look-alike passes, and a key-shaped ID
+    in a Secret or inside a gzipped release fails.

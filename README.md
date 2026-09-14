@@ -6,7 +6,9 @@ runbook, a canary. Each copy drifts, nobody measures whether the service is meet
 nothing stops a team from shipping into an outage it is already having.** paved is an internal
 developer platform built as a Kubernetes operator. A team writes one short `ServiceClaim`; paved turns
 it into all of that, keeps it that way, reads the service's error budget from Prometheus, freezes
-deploys when the budget is gone, and aborts a bad release halfway through its canary.
+deploys when the budget is gone, and aborts a bad release halfway through its canary. With one more
+line, `storage: true`, it also gives the service an S3 bucket and an IAM role that only its own pods
+can use, with no AWS key anywhere.
 
 This is the whole of what a team wrote to onboard [`shortlink`](services/shortlink), a URL shortener
 with its own code and image: 18 lines.
@@ -63,6 +65,8 @@ flowchart LR
     prometheus --> analysis["Canary analysis<br/>same recording rule"]
     analysis --> canary{"Canary:<br/>continue or abort?"}
     prometheus --> alerts["Burn-rate alerts<br/>page or ticket"]
+    reconciler --> ack["ACK Role and Bucket<br/>(storage: true)"]
+    ack --> aws["AWS: IAM role and S3 bucket,<br/>assumed with the cluster's<br/>own service-account token"]
 ```
 
 The error ratio Prometheus records for a claim has three jobs: it pages people when the budget burns
@@ -109,6 +113,23 @@ analysis reads an error ratio over 5% and Argo Rollouts aborts the canary with n
 cluster; the stable version never stops serving. Reverting the commit brings git back in line.
 [`demo/canary-demo.sh`](demo/canary-demo.sh)
 
+### 5. A claim gets storage, with no AWS key anywhere
+
+[![Demo 5: two claims ask for storage; a pod assumes its own claim's role, writes its bucket and is refused the other's; no AWS key is found in the cluster; a deleted claim's role goes and its bucket stays](docs/casts/05-storage.gif)](demo/05-storage.cast)
+
+Two teams add `storage: true` to their claims:
+- **ACK creates the AWS side.** It makes an IAM role and an S3 bucket for each claim, and both
+  claims are Ready 16 seconds later.
+- **Each pod reaches only its own bucket.** A pod runs as one claim's service account, with exactly
+  the identity paved put in that claim's Rollout. It writes and reads its own bucket, and AWS
+  refuses it the other claim's.
+- **No key is stored.** A scan of every Secret, ConfigMap and pod in the cluster finds no AWS key.
+- **Data outlives the claim.** Deleting a claim removes its role; its bucket, and the data in it,
+  stays.
+
+The AWS account ID is redacted from the recording. The demo is optional, since it needs an AWS
+account ([quickstart](#storage-on-aws-optional)). [`demo/05-storage.sh`](demo/05-storage.sh)
+
 ## Measured results
 
 Every number here was measured on this project's local k3d cluster (k3s v1.36.4 on Docker Desktop,
@@ -119,9 +140,12 @@ Apple silicon); how each was taken is recorded in [PROGRESS.md](PROGRESS.md).
 | Onboarding a second service | **7 s** from creating the claim file to `Ready=True` | `demo/onboard-demo.sh`: the file's creation to the claim's `Ready` transition. Its image was already built and pushed (24 s); typing the claim by hand is not included. |
 | YAML the team wrote | **18 lines** | Non-blank, non-comment lines of `deploy/claims/shortlink.yaml` |
 | Drift restore | **median 188 ms** (100 to 257 ms over 5 runs) | A deleted PrometheusRule: from `kubectl delete` returning to the watch's `ADDED` event, controller running in the cluster |
+| Storage for a claim | **16 s** from applying the claim to `StorageReady=True` and `Ready=True` | `demo/05-storage.sh` in the recording: the clock when the claims were applied, to the conditions' `lastTransitionTime`. The role was created, and the bucket, kept from an earlier run, adopted. |
+| A deleted claim's role | **Gone 49 s** after `kubectl delete`; IAM then answers `NoSuchEntity` | The same recording: the claim and its namespace gone, then `aws iam get-role`. The bucket is still there. |
+| AWS keys in the cluster | **0** in 26 Secrets, 76 ConfigMaps and 32 pods | The recording's scan: Secret values and Helm releases decoded, key IDs matched case-sensitively |
 | Canary abort | **62 s, 63 s, 63 s** (median 63 s) | From paved applying the bad image to the Rollout to the Rollout's `abortedAt`, in the recording and two more runs |
 | Reconcile p95 | **494 ms** (median 192 ms) | `controller_runtime_reconcile_time_seconds` on the in-cluster controller: 95 reconciles over 10 minutes, covering three claims' one-minute refreshes, shortlink's onboarding and five drift restores; interpolated inside the 450 to 500 ms bucket |
-| Tests | **105**, all passing | `go test -v`: 76 Go tests (71 in the operator module, envtest included and the Kind e2e suite excluded, and 5 in `services/shortlink`) and 29 Ginkgo specs (11 controller, 12 webhook, and the 6 in `test/`) |
+| Tests | **123**, all passing | `go test -v`: 92 Go tests (87 in the operator module, envtest included and the Kind e2e suite excluded, and 5 in `services/shortlink`) and 31 Ginkgo specs (11 controller, 12 webhook, and the 8 in `test/`) |
 
 ## What you cannot configure, and why
 
@@ -145,7 +169,8 @@ every service, and not in the API at all
 
 What a claim does have: `owner`, `image`, `port`, `tier` (public, internal or batch), `sli.type`
 (`http-availability`, with `goodStatuses`, or `http-latency`, with `latencyThreshold`),
-`slo.objective` and `slo.window`, and `scale.min` and `scale.max`.
+`slo.objective` and `slo.window`, `scale.min` and `scale.max`, and `storage`, which can't change once
+the claim exists.
 
 ## The service contract
 
@@ -163,6 +188,11 @@ the claim's `port`:
   start never count. That bug is the subject of [POSTMORTEM.md](POSTMORTEM.md).
 - **Count only application requests,** not probes or scrapes, and serve `/healthz` and `/readyz` on
   the same port. The container runs as UID 65532 with a read-only root filesystem.
+
+**A claim with `storage: true` needs nothing more from the service.** Its pods get
+`PAVED_STORAGE_BUCKET`, `AWS_REGION`, `AWS_ROLE_ARN`, and `AWS_WEB_IDENTITY_TOKEN_FILE` pointing at a
+token only AWS STS accepts. Any AWS SDK's default credentials assume the claim's role from these,
+with no key to configure.
 
 Go services get the metrics from `prometheus/client_golang`'s `promhttp.InstrumentHandlerCounter` and
 `InstrumentHandlerDuration`; [`services/shortlink`](services/shortlink) is a complete example with a
@@ -192,6 +222,36 @@ onboarding demos commit and push to `main`, so run them from your own fork. To r
 k3d cluster delete paved && k3d registry delete k3d-paved-registry
 ```
 
+### Storage on AWS (optional)
+
+Claims with `storage: true` need the cluster linked to an AWS account. It also needs the AWS CLI and
+Terraform. Log in with a short-lived session, not an access key: `hack/aws-up.sh` refuses a profile
+that stores one.
+
+```bash
+aws login --profile paved
+```
+
+```bash
+PAVED_AWS_PROFILE=paved make demo
+```
+
+This creates the AWS side with Terraform ([`infra/aws`](infra/aws)):
+- a bucket that publishes only the cluster's OIDC discovery document and signing keys
+- an IAM OIDC provider that trusts them
+- a permissions boundary for claims' roles
+- one scoped role for each ACK controller
+
+It then creates the cluster with that public issuer, and installs the ACK IAM and S3 controllers.
+Linked to the author's account it took **253 seconds**, with the cluster deleted first and the
+registry kept. Then run `PAVED_AWS_PROFILE=paved ./demo/05-storage.sh`.
+
+To remove the AWS side:
+1. Delete every claim with storage. Their roles go with them.
+2. Run `PAVED_AWS_PROFILE=paved make aws-down`. Terraform asks before it deletes anything.
+
+Buckets are kept by design, and yours to empty and delete.
+
 ## How it works
 
 - **Reconcile.** The controller server-side applies every object a claim's tier needs with one field
@@ -214,6 +274,11 @@ k3d cluster delete paved && k3d registry delete k3d-paved-registry
   the operator and every claim from git
   ([ADR-021](DECISIONS.md#adr-021-ci-scans-the-operator-image-before-anything-can-publish-it),
   [ADR-023](DECISIONS.md#adr-023-argo-cd-delivers-the-operator-and-the-claims-from-git-as-an-app-of-apps)).
+- **Storage.** A claim with `storage: true` gets an ACK `Role` and `Bucket`, applied like everything
+  else. The role trusts only that claim's service account and is capped by a permissions boundary.
+  Its pods assume it with a projected token that AWS verifies against the cluster's public issuer,
+  so no key exists to leak or rotate. Deleting the claim removes the role and keeps the bucket
+  ([ADR-025](DECISIONS.md#adr-025-claims-get-storage-through-the-clusters-own-identity-with-no-aws-key-anywhere)).
 - **Why an operator at all.** A Helm chart renders once; paved keeps objects as declared, reports
   status, and makes deploy decisions from live data
   ([ADR-024](DECISIONS.md#adr-024-paved-is-an-operator-not-a-helm-chart)).
@@ -227,13 +292,14 @@ internal/builders/   one pure function per managed object
 internal/slo/        error budgets, recording rules, burn-rate alerts
 internal/controller/ reconciler: resources, drift, error budget, deploy freeze, Ready
 internal/webhook/    admission webhook: rejects image changes during a freeze, audits break-glass
-test/                envtest suite (six specs), e2e suite, third-party CRDs for tests
+test/                envtest suite (eight specs), e2e suite, third-party CRDs for tests
 deploy/              what Argo CD applies: the app-of-apps, the operator overlay, the claims
 services/shortlink/  the second service: a URL shortener in its own module
 examples/testsvc/    the test service behind url-shortener and webhook-delivery
 demo/                demo scripts and their asciinema recordings
 docs/                runbooks the alerts link to, and the demo GIFs
 hack/                cluster bootstrap, make demo, image scripts
+infra/aws/           Terraform for the optional AWS link: public issuer, OIDC provider, boundary, ACK roles
 ```
 
 **Read next:** [DECISIONS.md](DECISIONS.md) for why each piece is the way it is,
