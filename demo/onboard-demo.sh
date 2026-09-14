@@ -81,7 +81,8 @@ git fetch -q origin main
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || fail "main is not level with origin/main"
 [ ! -e "$CLAIM_FILE" ] || fail "$CLAIM_FILE already exists: shortlink is already onboarded"
 if kubectl get serviceclaim "$CLAIM" -n "$CLAIM_NS" >/dev/null 2>&1; then fail "the $CLAIM claim already exists"; fi
-curl -sf "http://localhost:5001/v2/shortlink/manifests/0.1.0" -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' >/dev/null ||
+# The tag list, rather than the manifest: the manifest's media type depends on how the image was built.
+curl -sf "http://localhost:5001/v2/shortlink/tags/list" | grep -q '"0.1.0"' ||
   fail "$IMAGE is not in the registry; run hack/shortlink-image.sh"
 
 say "shortlink is a URL shortener with its own code, module and image. Nothing runs it yet"

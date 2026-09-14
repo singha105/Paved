@@ -158,6 +158,12 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
 
+##@ Demo
+
+.PHONY: demo
+demo: ## From a clean clone: create the k3d cluster and platform stack, push the example images, and let Argo CD deliver paved.
+	./hack/demo-up.sh
+
 ##@ Deployment
 
 ifndef ignore-not-found

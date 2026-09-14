@@ -27,6 +27,10 @@ ARGO_ROLLOUTS_VERSION="2.43.1"
 KUBE_PROMETHEUS_STACK_VERSION="90.1.2"
 ARGO_CD_VERSION="10.9.0"  # Argo CD v3.5.2, added on Day 6
 
+# BOOTSTRAP_GITOPS=false stops before applying the Argo CD root app, for callers such as make demo that
+# push the images the claims run first.
+BOOTSTRAP_GITOPS="${BOOTSTRAP_GITOPS:-true}"
+
 log() { printf '\n==> %s\n' "$*"; }
 
 k() { kubectl --context "$KUBE_CONTEXT" "$@"; }
@@ -143,7 +147,9 @@ main() {
   ensure_cluster
   add_repos
   install_stack
-  bootstrap_gitops
+  if [ "$BOOTSTRAP_GITOPS" = true ]; then
+    bootstrap_gitops
+  fi
   log "Cluster '$CLUSTER_NAME' is ready (kubectl context: $KUBE_CONTEXT, registry: localhost:$REGISTRY_PORT)"
 }
 
