@@ -1,0 +1,75 @@
+name: CI
+
+# Tests the operator, builds its image, scans the image with Trivy and, on main only, pushes it to
+# GHCR (DECISIONS.md, ADR-021). A HIGH or CRITICAL vulnerability with a fix available fails the run
+# before anything is pushed, so the image Argo CD deploys has passed the scan.
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  ci:
+    name: Test, scan and publish the operator image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      # Every action is pinned to a full commit SHA: in March 2026 most of trivy-action's version
+      # tags were force-pushed to credential-stealing code (CVE-2026-33634).
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go, with the module and build cache
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (packages that need no API server)
+        run: go test ./internal/builders/... ./internal/slo/... ./examples/...
+
+      - name: envtest (controller and webhook against a real API server)
+        run: make test
+
+      - name: Build the image
+        id: image
+        run: |
+          ref="${IMAGE}:sha-${GITHUB_SHA::7}"
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "$ref" .
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Scan the image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          image-ref: ${{ steps.image.outputs.ref }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Push to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          REF: ${{ steps.image.outputs.ref }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+          docker tag "$REF" "${IMAGE}:main"
+          docker push "$REF"
+          docker push "${IMAGE}:main"
