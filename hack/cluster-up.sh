@@ -150,7 +150,7 @@ publish_issuer() {
   log "Publishing the cluster's issuer documents to https://${ISSUER_HOST}"
   local document
   for document in .well-known/openid-configuration openid/v1/jwks; do
-    AWS_PROFILE="$PAVED_AWS_PROFILE" aws s3 cp "$dir/$(basename "$document")" "s3://${ISSUER_BUCKET}/${document}" \
+    AWS_PROFILE="$PAVED_AWS_PROFILE" AWS_REGION="$AWS_REGION" aws s3 cp "$dir/$(basename "$document")" "s3://${ISSUER_BUCKET}/${document}" \
       --content-type application/json --cache-control max-age=60 --only-show-errors
   done
   if [ "$(curl --fail --silent --show-error "https://${ISSUER_HOST}/openid/v1/jwks")" != "$(cat "$dir/jwks")" ]; then

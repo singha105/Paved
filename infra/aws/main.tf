@@ -75,9 +75,40 @@ resource "aws_s3_bucket_policy" "issuer" {
   depends_on = [aws_s3_bucket_public_access_block.issuer]
 }
 
+# IAM reads the discovery document when it creates the OIDC provider, before any cluster exists to
+# publish one. These placeholders name the issuer and an empty key set. hack/cluster-up.sh replaces
+# both with the cluster's, and Terraform leaves them alone from then on.
+locals {
+  issuer_placeholders = {
+    ".well-known/openid-configuration" = jsonencode({
+      issuer                                = "https://${local.issuer_host}"
+      jwks_uri                              = "https://${local.issuer_host}/openid/v1/jwks"
+      response_types_supported              = ["id_token"]
+      subject_types_supported               = ["public"]
+      id_token_signing_alg_values_supported = ["RS256"]
+    })
+    "openid/v1/jwks" = jsonencode({ keys = [] })
+  }
+}
+
+resource "aws_s3_object" "issuer_placeholder" {
+  for_each = local.issuer_placeholders
+
+  bucket       = aws_s3_bucket.issuer.id
+  key          = each.key
+  content      = each.value
+  content_type = "application/json"
+
+  lifecycle {
+    ignore_changes = [content, content_type, cache_control, etag, metadata]
+  }
+}
+
 resource "aws_iam_openid_connect_provider" "cluster" {
   url            = "https://${local.issuer_host}"
   client_id_list = [local.sts_audience]
+
+  depends_on = [aws_s3_bucket_policy.issuer, aws_s3_object.issuer_placeholder]
 }
 
 # --- What a claim's role can ever do -------------------------------------------------------------
@@ -173,6 +204,19 @@ data "aws_iam_policy_document" "ack_iam" {
     actions   = ["iam:DeleteRolePermissionsBoundary"]
     resources = ["*"]
   }
+  # Before creating a role, ACK looks it up. IAM can't know the path of a role that doesn't exist
+  # yet, so it checks that lookup against role/<name> instead of role/paved/workloads/<name>.
+  statement {
+    sid       = "LookUpClaimRolesByName"
+    actions   = ["iam:GetRole"]
+    resources = ["arn:aws:iam::${local.account_id}:role/paved-*"]
+  }
+  statement {
+    sid       = "NeverTheControllers"
+    effect    = "Deny"
+    actions   = ["iam:*"]
+    resources = ["arn:aws:iam::${local.account_id}:role/paved/controllers/*"]
+  }
 }
 
 resource "aws_iam_role_policy" "ack_iam" {
@@ -185,8 +229,9 @@ resource "aws_iam_role_policy" "ack_iam" {
 # them, and never touch the issuer bucket.
 data "aws_iam_policy_document" "ack_s3" {
   statement {
-    sid       = "ManagePavedBuckets"
-    actions   = ["s3:CreateBucket", "s3:DeleteBucket", "s3:Get*", "s3:List*", "s3:Put*"]
+    sid = "ManagePavedBuckets"
+    # s3-controller 1.12.1 tags buckets with TagResource, which s3:Put* doesn't cover.
+    actions   = ["s3:CreateBucket", "s3:DeleteBucket", "s3:Get*", "s3:List*", "s3:Put*", "s3:TagResource", "s3:UntagResource"]
     resources = [local.workload_buckets]
   }
   statement {
