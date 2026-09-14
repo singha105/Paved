@@ -37,6 +37,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// broken is set at build time, with -ldflags "-X main.broken=true", to make a bad release whose
+// every request to / fails. The probes and /metrics still answer, so its pods become ready and
+// take traffic: the canary rollback demo needs a version that deploys cleanly and then fails.
+var broken = "false"
+
 func main() {
 	addr := flag.String("addr", ":8080", "address to listen on")
 	flag.Parse()
@@ -79,7 +84,11 @@ func run(addr string) error {
 		return promhttp.InstrumentHandlerDuration(latency, promhttp.InstrumentHandlerCounter(requests, handler))
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/", instrument(ok))
+	root := ok
+	if broken == "true" {
+		root = boom
+	}
+	mux.Handle("/", instrument(root))
 	mux.Handle("/boom", instrument(boom))
 	mux.HandleFunc("/healthz", ok)
 	mux.HandleFunc("/readyz", ok)
@@ -92,7 +101,7 @@ func run(addr string) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Printf("Listening on %s", addr)
+		log.Printf("Listening on %s (broken=%s)", addr, broken)
 		serveErr <- srv.ListenAndServe()
 	}()
 

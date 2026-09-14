@@ -4,11 +4,13 @@ ARG BASE_IMAGE=golang:1.26
 FROM ${BASE_IMAGE} AS builder
 ARG TARGETOS
 ARG TARGETARCH
+# BROKEN=true builds a release whose every request to / fails (see main.go).
+ARG BROKEN=false
 
 WORKDIR /workspace
 # Relies on the repository's .dockerignore, which admits only Go sources and module files.
 COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o testsvc ./examples/testsvc
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags "-X main.broken=${BROKEN}" -o testsvc ./examples/testsvc
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=builder /workspace/testsvc /testsvc
