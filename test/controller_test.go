@@ -17,6 +17,8 @@ limitations under the License.
 package test
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -28,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
@@ -35,6 +38,7 @@ import (
 
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
 	"github.com/singha105/paved/internal/builders"
+	"github.com/singha105/paved/internal/controller"
 )
 
 const (
@@ -68,7 +72,7 @@ func createClaim(claim *platformv1alpha1.ServiceClaim) {
 // managedObjects lists every object, of every kind paved manages, that carries the claim's
 // ownership labels, across all namespaces.
 func managedObjects(g Gomega, claim *platformv1alpha1.ServiceClaim) []unstructured.Unstructured {
-	kinds := builders.ManagedTypes()
+	kinds := append(builders.ManagedTypes(), builders.StorageTypes()...)
 	objects := make([]unstructured.Unstructured, 0, len(kinds))
 	for _, kind := range kinds {
 		gvk, err := apiutil.GVKForObject(kind, k8sClient.Scheme())
@@ -111,6 +115,59 @@ func waitForObjects(claim *platformv1alpha1.ServiceClaim, count int) []unstructu
 		g.Expect(objects).To(HaveLen(count))
 	}).WithTimeout(waitTimeout).WithPolling(pollInterval).Should(Succeed())
 	return objects
+}
+
+// storageKey is where a claim's ACK Role and Bucket live.
+func storageKey(claim *platformv1alpha1.ServiceClaim) types.NamespacedName {
+	return types.NamespacedName{Namespace: builders.NamespaceName(claim), Name: claim.Name}
+}
+
+// getACKObject returns the claim's ACK object of kind gvk.
+func getACKObject(gvk schema.GroupVersionKind, claim *platformv1alpha1.ServiceClaim) *unstructured.Unstructured {
+	GinkgoHelper()
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	Expect(k8sClient.Get(ctx, storageKey(claim), obj)).To(Succeed())
+	return obj
+}
+
+// setACKConditions replaces the status conditions of the claim's ACK object of kind gvk, as the
+// ACK controller does once it has called AWS.
+func setACKConditions(gvk schema.GroupVersionKind, claim *platformv1alpha1.ServiceClaim, conditions ...map[string]any) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		g.Expect(k8sClient.Get(ctx, storageKey(claim), obj)).To(Succeed())
+		items := make([]any, 0, len(conditions))
+		for _, condition := range conditions {
+			items = append(items, condition)
+		}
+		g.Expect(unstructured.SetNestedSlice(obj.Object, items, "status", "conditions")).To(Succeed())
+		g.Expect(k8sClient.Status().Update(ctx, obj)).To(Succeed())
+	}).WithTimeout(waitTimeout).WithPolling(pollInterval).Should(Succeed())
+}
+
+// ackCondition is a condition the way ACK writes one.
+func ackCondition(conditionType string, status metav1.ConditionStatus, message string) map[string]any {
+	return map[string]any{"type": conditionType, "status": string(status), "message": message}
+}
+
+// expectStorageReady waits until the claim's StorageReady condition has the given status and
+// reason, and returns the claim as it was then.
+func expectStorageReady(
+	claim *platformv1alpha1.ServiceClaim, status metav1.ConditionStatus, reason string,
+) *platformv1alpha1.ServiceClaim {
+	GinkgoHelper()
+	current := &platformv1alpha1.ServiceClaim{}
+	Eventually(func(g Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), current)).To(Succeed())
+		condition := meta.FindStatusCondition(current.Status.Conditions, platformv1alpha1.ConditionStorageReady)
+		g.Expect(condition).NotTo(BeNil())
+		g.Expect(condition.Status).To(Equal(status), condition.Message)
+		g.Expect(condition.Reason).To(Equal(reason), condition.Message)
+	}).WithTimeout(waitTimeout).WithPolling(pollInterval).Should(Succeed())
+	return current
 }
 
 var _ = Describe("ServiceClaim controller", func() {
@@ -257,5 +314,64 @@ var _ = Describe("ServiceClaim controller", func() {
 		hpaKey := types.NamespacedName{Namespace: builders.NamespaceName(claim), Name: claim.Name}
 		Expect(k8sClient.Get(ctx, hpaKey, hpa)).To(Succeed())
 		Expect(hpa.Spec.MaxReplicas).To(Equal(int32(6)), "the edit reached the managed objects too")
+	})
+
+	It("storage: builds a Role only its service account can assume and a kept Bucket, then waits for ACK", func() {
+		claim := newClaim("storage-claim", platformv1alpha1.TierBatch)
+		claim.Spec.Storage = true
+		createClaim(claim)
+
+		counts := kindCounts(waitForObjects(claim, 10))
+		Expect(counts).To(HaveKeyWithValue(builders.RoleGVK.Kind, 1))
+		Expect(counts).To(HaveKeyWithValue(builders.BucketGVK.Kind, 1))
+
+		role := getACKObject(builders.RoleGVK, claim)
+		trust, _, err := unstructured.NestedString(role.Object, "spec", "assumeRolePolicyDocument")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(trust).To(ContainSubstring(`"oidc.envtest.example.com:sub":` +
+			`"system:serviceaccount:svc-storage-claim:storage-claim"`))
+		Expect(getACKObject(builders.BucketGVK, claim).GetAnnotations()).To(
+			HaveKeyWithValue("services.k8s.aws/deletion-policy", "retain"))
+
+		By("reporting where the storage is, and holding Ready back until ACK has created it")
+		current := expectStorageReady(claim, metav1.ConditionFalse, controller.ReasonStorageProvisioning)
+		Expect(current.Status.Storage).To(Equal(&platformv1alpha1.StorageStatus{
+			Bucket:  builders.StorageBucketName(claim, envtestStorage),
+			RoleARN: builders.StorageRoleARN(claim, envtestStorage),
+		}))
+		ready := meta.FindStatusCondition(current.Status.Conditions, platformv1alpha1.ConditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Reason).To(Equal(controller.ReasonStorageProvisioning))
+
+		By("reporting ACK's error when AWS refuses to create the role")
+		setACKConditions(builders.RoleGVK, claim,
+			ackCondition("ACK.Terminal", metav1.ConditionTrue, "AccessDenied: not authorized to perform iam:CreateRole"))
+		current = expectStorageReady(claim, metav1.ConditionFalse, controller.ReasonStorageFailed)
+		failed := meta.FindStatusCondition(current.Status.Conditions, platformv1alpha1.ConditionStorageReady)
+		Expect(failed.Message).To(ContainSubstring("AccessDenied"))
+
+		By("turning StorageReady True once ACK has synced both with AWS")
+		setACKConditions(builders.RoleGVK, claim, ackCondition("ACK.ResourceSynced", metav1.ConditionTrue, ""))
+		setACKConditions(builders.BucketGVK, claim, ackCondition("ACK.ResourceSynced", metav1.ConditionTrue, ""))
+		expectStorageReady(claim, metav1.ConditionTrue, controller.ReasonStorageProvisioned)
+	})
+
+	It("storage: can't be switched on after creation, and a storage claim's name must fit a bucket name", func() {
+		claim := newClaim("storage-later", platformv1alpha1.TierBatch)
+		createClaim(claim)
+		Eventually(func(g Gomega) {
+			current := &platformv1alpha1.ServiceClaim{}
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), current)).To(Succeed())
+			current.Spec.Storage = true
+			err := k8sClient.Update(ctx, current)
+			g.Expect(apierrors.IsInvalid(err)).To(BeTrue(), "want the update rejected as invalid, got %v", err)
+			g.Expect(err).To(MatchError(ContainSubstring("storage cannot be changed after the claim is created")))
+		}).WithTimeout(waitTimeout).WithPolling(pollInterval).Should(Succeed())
+
+		long := newClaim(strings.Repeat("s", builders.MaxStorageClaimNameLength+1), platformv1alpha1.TierBatch)
+		long.Spec.Storage = true
+		err := k8sClient.Create(ctx, long)
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "want the claim rejected as invalid, got %v", err)
+		Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf("at most %d characters", builders.MaxStorageClaimNameLength))))
 	})
 })

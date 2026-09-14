@@ -78,6 +78,9 @@ type ServiceClaimReconciler struct {
 	APIReader client.Reader
 	// Recorder records DriftCorrected Events. When nil, corrections are only logged.
 	Recorder events.EventRecorder
+	// Storage is the AWS account claims with storage get their bucket and role in. When nil, the
+	// cluster isn't linked to AWS, and those claims report StorageReady False (DECISIONS.md, ADR-025).
+	Storage *builders.StorageConfig
 }
 
 // +kubebuilder:rbac:groups=platform.paved.dev,resources=serviceclaims,verbs=get;list;watch;create;update;patch;delete
@@ -89,12 +92,15 @@ type ServiceClaimReconciler struct {
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=argoproj.io,resources=rollouts;analysistemplates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors;prometheusrules,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=iam.services.k8s.aws,resources=roles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=s3.services.k8s.aws,resources=buckets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile applies every object a ServiceClaim's tier requires, reports any it had to put
 // back, reads the claim's error budget from Prometheus, decides whether its deploys are frozen,
-// and records all of it in the claim's status. It requeues every minute to keep the budget current. A deleted claim is finalized
-// instead: its namespace is deleted, and the finalizer is released once the namespace is gone.
+// checks that ACK created its storage, and records all of it in the claim's status. It requeues
+// every minute to keep the budget current. A deleted claim is finalized instead: its namespace is
+// deleted, and the finalizer is released once the namespace is gone.
 func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -122,7 +128,7 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// The logger from controller-runtime already carries the claim's name and namespace.
 	log.Info("Reconciling ServiceClaim", "tier", claim.Spec.Tier, "generation", claim.Generation)
 
-	objects, err := builders.Build(&claim, nil)
+	objects, err := builders.Build(&claim, r.Storage)
 	if err != nil {
 		// The spec passed API validation but can't become resources, for example an
 		// unparseable latencyThreshold. Retrying won't help until the claim changes.
@@ -141,8 +147,8 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			Message:            "The SLO can't be evaluated until the spec is valid",
 			ObservedGeneration: claim.Generation,
 		}}
-		return ctrl.Result{}, r.applyStatus(ctx, &claim, 0, report,
-			invalid, report.condition, freezeCondition(&claim, report), readyCondition(&claim, invalid, nil, nil))
+		return ctrl.Result{}, r.applyStatus(ctx, &claim, 0, report, nil,
+			invalid, report.condition, freezeCondition(&claim, report), readyCondition(&claim, invalid, nil, nil, nil))
 	}
 
 	wasInSync := inSyncAtGeneration(&claim)
@@ -174,6 +180,8 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		log.Info("Deploy freeze changed", "frozen", frozen.Status, "reason", frozen.Reason, "message", frozen.Message)
 	}
 
+	storage := r.evaluateStorage(ctx, &claim)
+
 	rollout := &rolloutsv1alpha1.Rollout{}
 	var rolloutErr error
 	if applyErr == nil {
@@ -188,13 +196,18 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			rolloutErr = fmt.Errorf("getting Rollout %s: %w", key, err)
 		}
 	}
-	ready := readyCondition(&claim, synced, rollout, rolloutErr)
+	ready := readyCondition(&claim, synced, storage.condition, rollout, rolloutErr)
 	if apierrors.IsNotFound(rolloutErr) {
 		// Only a cache that hasn't caught up with the apply can miss it; its watch requeues the claim.
 		rolloutErr = nil
 	}
 
-	if err := r.applyStatus(ctx, &claim, applied, report, synced, report.condition, frozen, ready); err != nil {
+	conditions := []metav1.Condition{synced, report.condition, frozen}
+	if storage.condition != nil {
+		conditions = append(conditions, *storage.condition)
+	}
+	conditions = append(conditions, ready)
+	if err := r.applyStatus(ctx, &claim, applied, report, storage.status, conditions...); err != nil {
 		return ctrl.Result{}, errors.Join(applyErr, rolloutErr, err)
 	}
 	if err := errors.Join(applyErr, rolloutErr); err != nil {
@@ -285,7 +298,8 @@ func (r *ServiceClaimReconciler) applyFinalizer(ctx context.Context, claim *plat
 // request is built from scratch rather than from the fetched claim, so it carries only
 // those fields; a field left out, such as an unknown error budget, is cleared.
 func (r *ServiceClaimReconciler) applyStatus(
-	ctx context.Context, claim *platformv1alpha1.ServiceClaim, managed int, report sloReport, set ...metav1.Condition,
+	ctx context.Context, claim *platformv1alpha1.ServiceClaim, managed int, report sloReport,
+	storage *platformv1alpha1.StorageStatus, set ...metav1.Condition,
 ) error {
 	conditions := slices.Clone(claim.Status.Conditions)
 	for _, condition := range set {
@@ -315,6 +329,9 @@ func (r *ServiceClaimReconciler) applyStatus(
 	if report.burnRate1h != "" {
 		status["burnRate1h"] = report.burnRate1h
 	}
+	if storage != nil {
+		status["storage"] = map[string]any{"bucket": storage.Bucket, "roleARN": storage.RoleARN}
+	}
 
 	u := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": platformv1alpha1.GroupVersion.String(),
@@ -330,12 +347,18 @@ func (r *ServiceClaimReconciler) applyStatus(
 
 // SetupWithManager watches ServiceClaims and every kind of object they produce. Managed
 // objects have no owner references (DECISIONS.md, ADR-006), so each watch maps an object back
-// to its claim through the claim labels instead of using Owns().
+// to its claim through the claim labels instead of using Owns(). The ACK kinds are watched only on
+// a cluster linked to AWS, where cmd/main.go has checked that their CRDs are served; ACK's status
+// updates are what move a claim's StorageReady.
 func (r *ServiceClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.ServiceClaim{}, builder.WithPredicates(claimChanged())).
 		Named("serviceclaim")
-	for _, obj := range builders.ManagedTypes() {
+	watched := builders.ManagedTypes()
+	if r.Storage != nil {
+		watched = append(watched, builders.StorageTypes()...)
+	}
+	for _, obj := range watched {
 		b = b.Watches(obj, handler.EnqueueRequestsFromMapFunc(claimForObject))
 	}
 	return b.Complete(r)

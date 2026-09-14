@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -27,9 +28,11 @@ import (
 
 	rolloutsv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -71,14 +74,47 @@ func addToScheme(s *runtime.Scheme) error {
 
 // managedObjectCache limits the manager's cache for every managed kind to objects the
 // platform created. Without it the controller would hold every Namespace, ConfigMap and
-// Service in the cluster in memory. ServiceClaims are cached unfiltered.
-func managedObjectCache() cache.Options {
+// Service in the cluster in memory. ServiceClaims are cached unfiltered. With storage, the ACK
+// Roles and Buckets are managed kinds too.
+func managedObjectCache(storage bool) cache.Options {
 	managed := labels.SelectorFromSet(labels.Set{builders.LabelManagedBy: builders.ManagedBy})
-	byObject := make(map[client.Object]cache.ByObject)
-	for _, obj := range builders.ManagedTypes() {
+	kinds := builders.ManagedTypes()
+	if storage {
+		kinds = append(kinds, builders.StorageTypes()...)
+	}
+	byObject := make(map[client.Object]cache.ByObject, len(kinds))
+	for _, obj := range kinds {
 		byObject[obj] = cache.ByObject{Label: managed}
 	}
 	return cache.Options{ByObject: byObject}
+}
+
+// storageForCluster returns the AWS account claims with storage use, or nil when the cluster isn't
+// linked to AWS: there are no AWS settings in the environment, or no ACK CRDs to write a Role and
+// Bucket to (DECISIONS.md, ADR-025). Settings that are present but wrong, or an API server that
+// can't be asked, are errors.
+func storageForCluster(restConfig *rest.Config) (*builders.StorageConfig, error) {
+	storage, err := controller.StorageConfigFromEnv(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	if storage == nil {
+		setupLog.Info("Storage is off: no AWS settings in the environment")
+		return nil, nil
+	}
+	c, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("creating a client to look for the ACK CRDs: %w", err)
+	}
+	if err := controller.ServesStorageKinds(c.RESTMapper()); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return nil, err
+		}
+		setupLog.Info("Storage is off: the ACK CRDs are not installed", "reason", err.Error())
+		return nil, nil
+	}
+	setupLog.Info("Storage is on", "region", storage.Region, "issuer", storage.Issuer)
+	return storage, nil
 }
 
 // nolint:gocyclo
@@ -195,9 +231,16 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig := ctrl.GetConfigOrDie()
+	storage, err := storageForCluster(restConfig)
+	if err != nil {
+		setupLog.Error(err, "Failed to read the AWS storage settings")
+		os.Exit(1)
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
-		Cache:                  managedObjectCache(),
+		Cache:                  managedObjectCache(storage != nil),
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
@@ -233,6 +276,7 @@ func main() {
 		Prometheus: prometheus,
 		APIReader:  mgr.GetAPIReader(),
 		Recorder:   mgr.GetEventRecorder("paved-controller"),
+		Storage:    storage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "serviceclaim")
 		os.Exit(1)

@@ -149,7 +149,7 @@ func TestReadyCondition(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := readyCondition(unitTestClaim(), tt.synced, tt.rollout, tt.getErr)
+			got := readyCondition(unitTestClaim(), tt.synced, nil, tt.rollout, tt.getErr)
 			if got.Type != platformv1alpha1.ConditionReady || got.Status != tt.wantStatus ||
 				got.Reason != tt.wantReason || got.Message != tt.wantMessage {
 				t.Errorf("Ready is %s %s (%s) %q, want %s (%s) %q",

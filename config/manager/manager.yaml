@@ -65,6 +65,12 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        envFrom:
+        # AWS settings for claims with storage. hack/cluster-up.sh writes this ConfigMap on a
+        # cluster linked to AWS; without it, storage is off (DECISIONS.md, ADR-025).
+        - configMapRef:
+            name: paved-aws
+            optional: true
         ports:
         - containerPort: 8081
           name: health

@@ -39,6 +39,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	platformv1alpha1 "github.com/singha105/paved/api/v1alpha1"
+	"github.com/singha105/paved/internal/builders"
 	"github.com/singha105/paved/internal/controller"
 	"github.com/singha105/paved/internal/slo"
 )
@@ -50,6 +51,15 @@ var (
 	k8sClient  client.Client
 	reconciler *controller.ServiceClaimReconciler
 )
+
+// envtestStorage links the envtest cluster to a made-up AWS account. Nothing calls AWS: the
+// controller only writes ACK objects, and no ACK controller runs here, so the specs play its part.
+var envtestStorage = &builders.StorageConfig{
+	AccountID:              "123456789012",
+	Region:                 "eu-west-2",
+	Issuer:                 "oidc.envtest.example.com",
+	PermissionsBoundaryARN: "arn:aws:iam::123456789012:policy/paved/paved-workload-boundary",
+}
 
 func TestPaved(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -97,12 +107,15 @@ var _ = BeforeSuite(func() {
 		Metrics: metricsserver.Options{BindAddress: "0"},
 	})
 	Expect(err).NotTo(HaveOccurred())
+	By("checking the ACK CRDs are served, which cmd/main.go requires before it turns storage on")
+	Expect(controller.ServesStorageKinds(mgr.GetRESTMapper())).To(Succeed())
 	reconciler = &controller.ServiceClaimReconciler{
 		Client:     mgr.GetClient(),
 		Scheme:     scheme,
 		Prometheus: noTraffic{},
 		APIReader:  mgr.GetAPIReader(),
 		Recorder:   mgr.GetEventRecorder("paved-controller"),
+		Storage:    envtestStorage,
 	}
 	Expect(reconciler.SetupWithManager(mgr)).To(Succeed())
 

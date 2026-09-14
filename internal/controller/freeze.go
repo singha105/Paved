@@ -88,10 +88,12 @@ func freezeCondition(claim *platformv1alpha1.ServiceClaim, report sloReport) met
 }
 
 // readyCondition reports whether a claim's service is running as claimed: every managed resource
-// is applied, and Argo Rollouts reports the Rollout healthy at its current generation. getErr is
-// the error from reading the Rollout, if there was one.
+// is applied, its storage exists if it asked for any, and Argo Rollouts reports the Rollout healthy
+// at its current generation. storage is the claim's StorageReady condition, nil without storage.
+// getErr is the error from reading the Rollout, if there was one.
 func readyCondition(
-	claim *platformv1alpha1.ServiceClaim, synced metav1.Condition, rollout *rolloutsv1alpha1.Rollout, getErr error,
+	claim *platformv1alpha1.ServiceClaim, synced metav1.Condition, storage *metav1.Condition,
+	rollout *rolloutsv1alpha1.Rollout, getErr error,
 ) metav1.Condition {
 	condition := metav1.Condition{
 		Type:               platformv1alpha1.ConditionReady,
@@ -102,6 +104,13 @@ func readyCondition(
 	case synced.Status != metav1.ConditionTrue:
 		condition.Reason = synced.Reason
 		condition.Message = "The managed resources are not all applied: " + synced.Message
+	case storage != nil && storage.Status != metav1.ConditionTrue:
+		// A service that asked for a bucket isn't ready to serve until the bucket and its role exist.
+		if storage.Status == metav1.ConditionUnknown {
+			condition.Status = metav1.ConditionUnknown
+		}
+		condition.Reason = storage.Reason
+		condition.Message = "The claim's storage is not ready: " + storage.Message
 	case apierrors.IsNotFound(getErr):
 		condition.Reason = ReasonRolloutNotFound
 		condition.Message = "The Rollout does not exist yet"
