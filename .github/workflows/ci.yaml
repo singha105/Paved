@@ -39,6 +39,10 @@ jobs:
       - name: go test (packages that need no API server)
         run: go test ./internal/builders/... ./internal/slo/... ./examples/...
 
+      - name: go test services/shortlink (a separate module, the second onboarded service)
+        working-directory: services/shortlink
+        run: go test ./...
+
       - name: envtest (controller and webhook against a real API server)
         run: make test
 
