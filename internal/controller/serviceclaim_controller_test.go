@@ -113,20 +113,20 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 		})).To(Succeed())
 	})
 
-	It("adds the finalizer, applies the internal tier's 11 resources and reports status", func() {
+	It("adds the finalizer, applies the internal tier's 12 resources and reports status", func() {
 		result := reconcileClaim()
 		Expect(result.RequeueAfter).To(Equal(time.Minute), "the claim must requeue to keep its budget fresh")
 
 		claim := getClaim()
 		Expect(controllerutil.ContainsFinalizer(claim, Finalizer)).To(BeTrue())
-		Expect(resourceVersions(claim)).To(HaveLen(11))
+		Expect(resourceVersions(claim)).To(HaveLen(12))
 		Expect(recorder.Events).To(BeEmpty(), "creating a claim's resources is not drift")
 
 		synced := meta.FindStatusCondition(claim.Status.Conditions, platformv1alpha1.ConditionResourcesSynced)
 		Expect(synced).NotTo(BeNil())
 		Expect(synced.Status).To(Equal(metav1.ConditionTrue))
 		Expect(synced.Reason).To(Equal(ReasonApplied))
-		Expect(claim.Status.ManagedResources).To(Equal(11))
+		Expect(claim.Status.ManagedResources).To(Equal(12))
 		Expect(claim.Status.ObservedGeneration).To(Equal(claim.Generation))
 		Expect(claim.Status.LastReconcileTime).NotTo(BeNil())
 

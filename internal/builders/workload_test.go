@@ -96,7 +96,7 @@ func TestBuildRolloutCanarySteps(t *testing.T) {
 			got = append(got, "unexpected step")
 		}
 	}
-	want := []string{"weight 20", "pause 30s", "weight 50", "pause 30s", "weight 100"}
+	want := []string{"weight 20", "pause 2m", "weight 50", "pause 2m", "weight 100"}
 	if len(got) != len(want) {
 		t.Fatalf("steps = %v, want %v", got, want)
 	}
@@ -226,4 +226,22 @@ func quantity(list corev1.ResourceList, name corev1.ResourceName) string {
 		return "<unset>"
 	}
 	return q.String()
+}
+
+func TestBuildRolloutCanaryAnalysis(t *testing.T) {
+	for _, tier := range []string{platformv1alpha1.TierPublic, platformv1alpha1.TierInternal} {
+		analysis := BuildRollout(newClaim(tier)).Spec.Strategy.Canary.Analysis
+		if analysis == nil {
+			t.Fatalf("%s: the canary has no analysis", tier)
+		}
+		if len(analysis.Templates) != 1 || analysis.Templates[0].TemplateName != wantAnalysisName {
+			t.Errorf("%s: analysis templates = %+v, want only %s", tier, analysis.Templates, wantAnalysisName)
+		}
+		if analysis.StartingStep == nil || *analysis.StartingStep != 1 {
+			t.Errorf("%s: analysis startingStep = %v, want 1, the first pause", tier, analysis.StartingStep)
+		}
+	}
+	if analysis := BuildRollout(newClaim(platformv1alpha1.TierBatch)).Spec.Strategy.Canary.Analysis; analysis != nil {
+		t.Errorf("batch canary has analysis %+v, want none: a batch claim has no traffic to measure", analysis)
+	}
 }

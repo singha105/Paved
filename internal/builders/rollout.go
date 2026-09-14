@@ -41,7 +41,14 @@ const (
 	probeFailureThreshold       int32 = 3
 	livenessInitialDelaySeconds int32 = 10
 
-	canaryPause = "30s"
+	// canaryPause is long enough for the canary analysis to see a bad version: a scrape, a
+	// recording rule evaluation and an analysis measurement are each up to 30s apart
+	// (DECISIONS.md, ADR-022).
+	canaryPause = "2m"
+
+	// analysisStartingStep starts the canary analysis at the first pause, once 20% of the
+	// replicas run the new version and take traffic.
+	analysisStartingStep int32 = 1
 
 	publicMinReplicas int32 = 2
 
@@ -68,7 +75,8 @@ func HasAutoscaling(sc *platformv1alpha1.ServiceClaim) bool {
 
 // BuildRollout returns the claim's workload: an Argo Rollout that moves to a new version
 // through the platform's canary steps, splitting by replica count rather than by routed
-// traffic. When the tier has an HPA, spec.replicas is left unset so the HPA owns the replica
+// traffic. Unless the claim is batch, an analysis of its SLI runs through the canary and aborts
+// it when the error ratio passes 5%. When the tier has an HPA, spec.replicas is left unset so the HPA owns the replica
 // count and the controller never reverts a scaling decision (DECISIONS.md, ADR-008).
 func BuildRollout(sc *platformv1alpha1.ServiceClaim) *rolloutsv1alpha1.Rollout {
 	rollout := &rolloutsv1alpha1.Rollout{
@@ -85,13 +93,28 @@ func BuildRollout(sc *platformv1alpha1.ServiceClaim) *rolloutsv1alpha1.Rollout {
 			},
 		},
 	}
+	if HasCanaryAnalysis(sc) {
+		rollout.Spec.Strategy.Canary.Analysis = canaryAnalysis(sc)
+	}
 	if !HasAutoscaling(sc) {
 		rollout.Spec.Replicas = new(MinReplicas(sc))
 	}
 	return rollout
 }
 
-// canarySteps moves 20% of replicas to the new version, waits 30s, moves to 50%, waits 30s,
+// canaryAnalysis runs the claim's AnalysisTemplate in the background from the first pause until
+// the rollout finishes. A failed measurement aborts the rollout, which scales the canary back
+// down and leaves the stable version serving.
+func canaryAnalysis(sc *platformv1alpha1.ServiceClaim) *rolloutsv1alpha1.RolloutAnalysisBackground {
+	return &rolloutsv1alpha1.RolloutAnalysisBackground{
+		RolloutAnalysis: rolloutsv1alpha1.RolloutAnalysis{
+			Templates: []rolloutsv1alpha1.AnalysisTemplateRef{{TemplateName: CanaryAnalysisName(sc)}},
+		},
+		StartingStep: new(analysisStartingStep),
+	}
+}
+
+// canarySteps moves 20% of replicas to the new version, waits 2m, moves to 50%, waits 2m,
 // then completes the rollout.
 func canarySteps() []rolloutsv1alpha1.CanaryStep {
 	pause := func() *rolloutsv1alpha1.RolloutPause {

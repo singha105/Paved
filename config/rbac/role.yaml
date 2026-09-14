@@ -22,6 +22,7 @@ rules:
 - apiGroups:
   - argoproj.io
   resources:
+  - analysistemplates
   - rollouts
   verbs:
   - create

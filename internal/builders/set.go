@@ -33,10 +33,11 @@ import (
 //
 //	every tier:        Namespace, ServiceAccount, Rollout, NetworkPolicy, PrometheusRule,
 //	                   ServiceMonitor, dashboard ConfigMap, runbook ConfigMap
-//	public, internal:  + Service, HorizontalPodAutoscaler, PodDisruptionBudget
+//	public, internal:  + AnalysisTemplate, Service, HorizontalPodAutoscaler, PodDisruptionBudget
 //	public:            + Ingress
 //
-// That is 12 objects for public, 11 for internal and 8 for batch (DECISIONS.md, ADR-011). It
+// That is 13 objects for public, 12 for internal and 8 for batch (DECISIONS.md, ADR-011 and
+// ADR-022). It
 // returns an error when the claim's SLI or SLO can't be turned into rules, such as an
 // unparseable latencyThreshold.
 func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
@@ -53,16 +54,19 @@ func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
 		return nil, err
 	}
 
-	objects := []client.Object{
-		BuildNamespace(sc),
-		BuildServiceAccount(sc),
+	objects := []client.Object{BuildNamespace(sc), BuildServiceAccount(sc)}
+	if HasCanaryAnalysis(sc) {
+		// Before the Rollout, so the template exists when Argo Rollouts starts an analysis.
+		objects = append(objects, BuildAnalysisTemplate(sc))
+	}
+	objects = append(objects,
 		BuildRollout(sc),
 		BuildNetworkPolicy(sc),
 		rule,
 		BuildServiceMonitor(sc),
 		dashboard,
 		runbook,
-	}
+	)
 	if HasAutoscaling(sc) {
 		objects = append(objects, BuildService(sc), BuildHPA(sc), BuildPodDisruptionBudget(sc))
 	}
@@ -79,6 +83,7 @@ func ManagedTypes() []client.Object {
 		&corev1.Namespace{},
 		&corev1.ServiceAccount{},
 		&rolloutsv1alpha1.Rollout{},
+		&rolloutsv1alpha1.AnalysisTemplate{},
 		&networkingv1.NetworkPolicy{},
 		&monitoringv1.PrometheusRule{},
 		&monitoringv1.ServiceMonitor{},

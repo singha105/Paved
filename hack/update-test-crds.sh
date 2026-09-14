@@ -16,8 +16,10 @@ fetch() {
   curl --fail --silent --show-error --location "$url" --output "$DEST/$file"
 }
 
-fetch "https://raw.githubusercontent.com/argoproj/argo-rollouts/${ARGO_ROLLOUTS_VERSION}/manifests/crds/rollout-crd.yaml" \
-  argoproj.io_rollouts.yaml
+for crd in rollout analysis-template; do
+  fetch "https://raw.githubusercontent.com/argoproj/argo-rollouts/${ARGO_ROLLOUTS_VERSION}/manifests/crds/${crd}-crd.yaml" \
+    "argoproj.io_${crd//-/}s.yaml"
+done
 
 for crd in servicemonitors prometheusrules; do
   fetch "https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/${PROMETHEUS_OPERATOR_VERSION}/example/prometheus-operator-crd/monitoring.coreos.com_${crd}.yaml" \

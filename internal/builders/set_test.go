@@ -32,6 +32,10 @@ var baseKinds = []string{
 	"PrometheusRule", "ServiceMonitor", "ConfigMap", "ConfigMap",
 }
 
+// analysedKinds are the kinds of a tier with canary analysis: the AnalysisTemplate comes right
+// before the Rollout that references it.
+var analysedKinds = slices.Insert(slices.Clone(baseKinds), 2, "AnalysisTemplate")
+
 // mustBuild returns Build's objects for sc, failing the test if Build returns an error.
 func mustBuild(t *testing.T, sc *platformv1alpha1.ServiceClaim) []client.Object {
 	t.Helper()
@@ -47,8 +51,8 @@ func TestBuildResourceCountPerTier(t *testing.T) {
 		tier string
 		want int
 	}{
-		{platformv1alpha1.TierPublic, 12},
-		{platformv1alpha1.TierInternal, 11},
+		{platformv1alpha1.TierPublic, 13},
+		{platformv1alpha1.TierInternal, 12},
 		{platformv1alpha1.TierBatch, 8},
 	}
 	for _, tt := range tests {
@@ -65,9 +69,9 @@ func TestBuildKindsPerTier(t *testing.T) {
 		tier string
 		want []string
 	}{
-		{platformv1alpha1.TierPublic, append(slices.Clone(baseKinds),
+		{platformv1alpha1.TierPublic, append(slices.Clone(analysedKinds),
 			"Service", "HorizontalPodAutoscaler", "PodDisruptionBudget", "Ingress")},
-		{platformv1alpha1.TierInternal, append(slices.Clone(baseKinds),
+		{platformv1alpha1.TierInternal, append(slices.Clone(analysedKinds),
 			"Service", "HorizontalPodAutoscaler", "PodDisruptionBudget")},
 		{platformv1alpha1.TierBatch, slices.Clone(baseKinds)},
 	}
