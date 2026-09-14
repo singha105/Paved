@@ -161,8 +161,20 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 ##@ Demo
 
 .PHONY: demo
-demo: ## From a clean clone: create the k3d cluster and platform stack, push the example images, and let Argo CD deliver paved.
+demo: ## From a clean clone: create the k3d cluster and platform stack, push the example images, and let Argo CD deliver paved. Set PAVED_AWS_PROFILE to link the cluster to AWS too.
 	./hack/demo-up.sh
+
+##@ AWS (optional: claims with storage, DECISIONS.md ADR-025)
+
+.PHONY: aws-up
+aws-up: ## Create paved's one-time AWS resources (infra/aws) with a short-lived session: aws login --profile paved, then PAVED_AWS_PROFILE=paved make aws-up.
+	@test -n "$(PAVED_AWS_PROFILE)" || { echo "error: set PAVED_AWS_PROFILE to a profile you logged in to with: aws login --profile <name>" >&2; exit 1; }
+	AWS_PROFILE="$(PAVED_AWS_PROFILE)" ./hack/aws-up.sh
+
+.PHONY: aws-down
+aws-down: ## Delete paved's one-time AWS resources; Terraform asks first. Delete claims with storage before this. Their buckets are kept, and are yours to empty and delete.
+	@test -n "$(PAVED_AWS_PROFILE)" || { echo "error: set PAVED_AWS_PROFILE to a profile you logged in to with: aws login --profile <name>" >&2; exit 1; }
+	AWS_PROFILE="$(PAVED_AWS_PROFILE)" terraform -chdir=infra/aws destroy
 
 ##@ Deployment
 

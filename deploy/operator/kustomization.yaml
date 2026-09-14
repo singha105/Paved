@@ -8,4 +8,4 @@ resources:
 images:
   - name: paved-controller
     newName: ghcr.io/singha105/paved
-    newTag: sha-8d12dc8
+    newTag: sha-364dd64

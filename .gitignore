@@ -28,3 +28,9 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+
+# Terraform: the provider cache and local state (infra/aws). The lock file is committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
