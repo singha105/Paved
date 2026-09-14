@@ -35,12 +35,13 @@ import (
 //	                   ServiceMonitor, dashboard ConfigMap, runbook ConfigMap
 //	public, internal:  + AnalysisTemplate, Service, HorizontalPodAutoscaler, PodDisruptionBudget
 //	public:            + Ingress
+//	with storage:      + ACK Role, ACK Bucket, when the cluster is linked to AWS
 //
 // That is 13 objects for public, 12 for internal and 8 for batch (DECISIONS.md, ADR-011 and
-// ADR-022). It
-// returns an error when the claim's SLI or SLO can't be turned into rules, such as an
-// unparseable latencyThreshold.
-func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
+// ADR-022), and 2 more with storage (ADR-025). storage is the cluster's AWS account, or nil
+// when the cluster has none. It returns an error when the claim's SLI or SLO can't be turned
+// into rules, such as an unparseable latencyThreshold.
+func Build(sc *platformv1alpha1.ServiceClaim, storage *StorageConfig) ([]client.Object, error) {
 	rule, err := BuildPrometheusRule(sc)
 	if err != nil {
 		return nil, err
@@ -55,12 +56,19 @@ func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
 	}
 
 	objects := []client.Object{BuildNamespace(sc), BuildServiceAccount(sc)}
+	if HasStorage(sc, storage) {
+		role, err := BuildStorageRole(sc, storage)
+		if err != nil {
+			return nil, err
+		}
+		objects = append(objects, role, BuildStorageBucket(sc, storage))
+	}
 	if HasCanaryAnalysis(sc) {
 		// Before the Rollout, so the template exists when Argo Rollouts starts an analysis.
 		objects = append(objects, BuildAnalysisTemplate(sc))
 	}
 	objects = append(objects,
-		BuildRollout(sc),
+		BuildRollout(sc, storage),
 		BuildNetworkPolicy(sc),
 		rule,
 		BuildServiceMonitor(sc),
@@ -76,8 +84,8 @@ func Build(sc *platformv1alpha1.ServiceClaim) ([]client.Object, error) {
 	return objects, nil
 }
 
-// ManagedTypes returns an empty object of every kind Build can produce. The controller
-// watches and caches exactly these kinds.
+// ManagedTypes returns an empty object of every built-in and typed kind Build can produce. The
+// controller watches and caches exactly these kinds, plus StorageTypes on a cluster linked to AWS.
 func ManagedTypes() []client.Object {
 	return []client.Object{
 		&corev1.Namespace{},

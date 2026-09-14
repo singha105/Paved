@@ -79,7 +79,7 @@ var _ = Describe("ServiceClaim Controller", Ordered, func() {
 	resourceVersions := func(claim *platformv1alpha1.ServiceClaim) map[string]string {
 		GinkgoHelper()
 		versions := map[string]string{}
-		objects, err := builders.Build(claim)
+		objects, err := builders.Build(claim, nil)
 		Expect(err).NotTo(HaveOccurred())
 		for _, obj := range objects {
 			id := fmt.Sprintf("%s %s", obj.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(obj))

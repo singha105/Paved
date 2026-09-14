@@ -16,8 +16,9 @@ limitations under the License.
 
 // Package builders turns a ServiceClaim into the Kubernetes objects the platform manages.
 //
-// Every function here is pure: it reads only the claim, makes no API calls and uses no
-// clock or randomness, so its output can be unit-tested without a cluster. The settings a
+// Every function here is pure: it reads only the claim and the cluster's AWS storage settings,
+// makes no API calls and uses no clock or randomness, so its output can be unit-tested without
+// a cluster. The settings a
 // developer cannot choose (resource limits, security context, probes, canary steps) are
 // constants in this package (DECISIONS.md, ADR-001).
 package builders

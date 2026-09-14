@@ -77,8 +77,9 @@ func HasAutoscaling(sc *platformv1alpha1.ServiceClaim) bool {
 // through the platform's canary steps, splitting by replica count rather than by routed
 // traffic. Unless the claim is batch, an analysis of its SLI runs through the canary and aborts
 // it when the error ratio passes 5%. When the tier has an HPA, spec.replicas is left unset so the HPA owns the replica
-// count and the controller never reverts a scaling decision (DECISIONS.md, ADR-008).
-func BuildRollout(sc *platformv1alpha1.ServiceClaim) *rolloutsv1alpha1.Rollout {
+// count and the controller never reverts a scaling decision (DECISIONS.md, ADR-008). A claim with
+// storage also gives its pods the AWS identity of its role (ADR-025).
+func BuildRollout(sc *platformv1alpha1.ServiceClaim, storage *StorageConfig) *rolloutsv1alpha1.Rollout {
 	rollout := &rolloutsv1alpha1.Rollout{
 		TypeMeta:   metav1.TypeMeta{APIVersion: rolloutsv1alpha1.SchemeGroupVersion.String(), Kind: rolloutKind},
 		ObjectMeta: objectMeta(sc, sc.Name),
@@ -86,7 +87,7 @@ func BuildRollout(sc *platformv1alpha1.ServiceClaim) *rolloutsv1alpha1.Rollout {
 			Selector: &metav1.LabelSelector{MatchLabels: SelectorLabels(sc)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: Labels(sc)},
-				Spec:       podSpec(sc),
+				Spec:       podSpec(sc, storage),
 			},
 			Strategy: rolloutsv1alpha1.RolloutStrategy{
 				Canary: &rolloutsv1alpha1.CanaryStrategy{Steps: canarySteps()},
@@ -130,9 +131,10 @@ func canarySteps() []rolloutsv1alpha1.CanaryStep {
 }
 
 // podSpec is the pod every claim runs: one container, non-root, read-only root filesystem,
-// no capabilities, fixed resources, and HTTP probes on the named port.
-func podSpec(sc *platformv1alpha1.ServiceClaim) corev1.PodSpec {
-	return corev1.PodSpec{
+// no capabilities, fixed resources, and HTTP probes on the named port. With storage, it also
+// carries the claim's AWS identity.
+func podSpec(sc *platformv1alpha1.ServiceClaim, storage *StorageConfig) corev1.PodSpec {
+	spec := corev1.PodSpec{
 		ServiceAccountName: sc.Name,
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot:   new(true),
@@ -157,6 +159,10 @@ func podSpec(sc *platformv1alpha1.ServiceClaim) corev1.PodSpec {
 			LivenessProbe:  httpProbe(livenessPath, livenessInitialDelaySeconds),
 		}},
 	}
+	if HasStorage(sc, storage) {
+		withStorageIdentity(&spec, sc, storage)
+	}
+	return spec
 }
 
 // containerResources requests 50m CPU and 64Mi memory, and limits the container to 250m

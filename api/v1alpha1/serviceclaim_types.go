@@ -26,6 +26,7 @@ const (
 	ConditionResourcesSynced = "ResourcesSynced"
 	ConditionSLOHealthy      = "SLOHealthy"
 	ConditionDeploysFrozen   = "DeploysFrozen"
+	ConditionStorageReady    = "StorageReady"
 	ConditionReady           = "Ready"
 )
 
@@ -62,6 +63,16 @@ type ServiceClaimSpec struct {
 	SLI   SLISpec   `json:"sli"`
 	SLO   SLOSpec   `json:"slo"`
 	Scale ScaleSpec `json:"scale"`
+
+	// Storage gives the claim's pods an S3 bucket only they can use, through an IAM role they
+	// assume with the cluster's service-account tokens, so no AWS key is stored anywhere
+	// (DECISIONS.md, ADR-025). It takes effect on a cluster linked to an AWS account. It can't be
+	// changed once the claim exists: paved never deletes objects it stops building, so turning it
+	// off would leave a live role and bucket behind.
+	// +kubebuilder:default=false
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="storage cannot be changed after the claim is created"
+	// +optional
+	Storage bool `json:"storage,omitempty"`
 }
 
 // SLISpec selects how "good" requests are measured.
@@ -108,6 +119,17 @@ type ServiceClaimStatus struct {
 	ManagedResources     int                `json:"managedResources,omitempty"`
 	ObservedGeneration   int64              `json:"observedGeneration,omitempty"`
 	LastReconcileTime    *metav1.Time       `json:"lastReconcileTime,omitempty"`
+	// Storage names the claim's bucket and the role its pods assume, when it has storage.
+	// +optional
+	Storage *StorageStatus `json:"storage,omitempty"`
+}
+
+// StorageStatus is where a claim's storage lives in AWS.
+type StorageStatus struct {
+	// Bucket is the name of the claim's S3 bucket.
+	Bucket string `json:"bucket"`
+	// RoleARN is the IAM role the claim's pods assume.
+	RoleARN string `json:"roleARN"`
 }
 
 // +kubebuilder:object:root=true
@@ -119,6 +141,7 @@ type ServiceClaimStatus struct {
 // +kubebuilder:printcolumn:name="Frozen",type=string,JSONPath=`.status.conditions[?(@.type=="DeploysFrozen")].status`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.storage) || !self.spec.storage || size(self.metadata.name) <= 48",message="a claim with storage needs a name of at most 48 characters, so its bucket name fits in S3's 63"
 
 // ServiceClaim is one developer's request for a production-shaped service. The
 // controller reconciles it into its own namespace, svc-<name>.

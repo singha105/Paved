@@ -141,6 +141,18 @@ spec:
                 required:
                 - objective
                 type: object
+              storage:
+                default: false
+                description: |-
+                  Storage gives the claim's pods an S3 bucket only they can use, through an IAM role they
+                  assume with the cluster's service-account tokens, so no AWS key is stored anywhere
+                  (DECISIONS.md, ADR-025). It takes effect on a cluster linked to an AWS account. It can't be
+                  changed once the claim exists: paved never deletes objects it stops building, so turning it
+                  off would leave a live role and bucket behind.
+                type: boolean
+                x-kubernetes-validations:
+                - message: storage cannot be changed after the claim is created
+                  rule: self == oldSelf
               tier:
                 enum:
                 - public
@@ -230,10 +242,29 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              storage:
+                description: Storage names the claim's bucket and the role its pods
+                  assume, when it has storage.
+                properties:
+                  bucket:
+                    description: Bucket is the name of the claim's S3 bucket.
+                    type: string
+                  roleARN:
+                    description: RoleARN is the IAM role the claim's pods assume.
+                    type: string
+                required:
+                - bucket
+                - roleARN
+                type: object
             type: object
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: a claim with storage needs a name of at most 48 characters, so
+            its bucket name fits in S3's 63
+          rule: '!has(self.spec.storage) || !self.spec.storage || size(self.metadata.name)
+            <= 48'
     served: true
     storage: true
     subresources:

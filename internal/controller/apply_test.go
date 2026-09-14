@@ -53,7 +53,7 @@ func unitTestClaim() *platformv1alpha1.ServiceClaim {
 }
 
 func TestToApplyObjectSendsOnlyBuilderFields(t *testing.T) {
-	objects, err := builders.Build(unitTestClaim())
+	objects, err := builders.Build(unitTestClaim(), nil)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

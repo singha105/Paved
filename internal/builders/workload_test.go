@@ -65,7 +65,7 @@ func TestBuildRolloutReplicas(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.tier, func(t *testing.T) {
-			got := BuildRollout(newClaim(tt.tier)).Spec.Replicas
+			got := BuildRollout(newClaim(tt.tier), nil).Spec.Replicas
 			switch {
 			case tt.want == nil && got != nil:
 				t.Errorf("replicas = %d, want unset so the HPA owns it", *got)
@@ -77,7 +77,7 @@ func TestBuildRolloutReplicas(t *testing.T) {
 }
 
 func TestBuildRolloutCanarySteps(t *testing.T) {
-	canary := BuildRollout(newClaim(platformv1alpha1.TierPublic)).Spec.Strategy.Canary
+	canary := BuildRollout(newClaim(platformv1alpha1.TierPublic), nil).Spec.Strategy.Canary
 	if canary == nil {
 		t.Fatal("strategy.canary is nil")
 	}
@@ -109,7 +109,7 @@ func TestBuildRolloutCanarySteps(t *testing.T) {
 
 func TestBuildRolloutPodSpec(t *testing.T) {
 	sc := newClaim(platformv1alpha1.TierPublic)
-	rollout := BuildRollout(sc)
+	rollout := BuildRollout(sc, nil)
 	pod := rollout.Spec.Template.Spec
 
 	if !maps.Equal(rollout.Spec.Selector.MatchLabels, SelectorLabels(sc)) {
@@ -230,7 +230,7 @@ func quantity(list corev1.ResourceList, name corev1.ResourceName) string {
 
 func TestBuildRolloutCanaryAnalysis(t *testing.T) {
 	for _, tier := range []string{platformv1alpha1.TierPublic, platformv1alpha1.TierInternal} {
-		analysis := BuildRollout(newClaim(tier)).Spec.Strategy.Canary.Analysis
+		analysis := BuildRollout(newClaim(tier), nil).Spec.Strategy.Canary.Analysis
 		if analysis == nil {
 			t.Fatalf("%s: the canary has no analysis", tier)
 		}
@@ -241,7 +241,7 @@ func TestBuildRolloutCanaryAnalysis(t *testing.T) {
 			t.Errorf("%s: analysis startingStep = %v, want 1, the first pause", tier, analysis.StartingStep)
 		}
 	}
-	if analysis := BuildRollout(newClaim(platformv1alpha1.TierBatch)).Spec.Strategy.Canary.Analysis; analysis != nil {
+	if analysis := BuildRollout(newClaim(platformv1alpha1.TierBatch), nil).Spec.Strategy.Canary.Analysis; analysis != nil {
 		t.Errorf("batch canary has analysis %+v, want none: a batch claim has no traffic to measure", analysis)
 	}
 }

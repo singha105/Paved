@@ -122,7 +122,7 @@ func (r *ServiceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// The logger from controller-runtime already carries the claim's name and namespace.
 	log.Info("Reconciling ServiceClaim", "tier", claim.Spec.Tier, "generation", claim.Generation)
 
-	objects, err := builders.Build(&claim)
+	objects, err := builders.Build(&claim, nil)
 	if err != nil {
 		// The spec passed API validation but can't become resources, for example an
 		// unparseable latencyThreshold. Retrying won't help until the claim changes.

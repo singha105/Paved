@@ -39,7 +39,7 @@ var analysedKinds = slices.Insert(slices.Clone(baseKinds), 2, "AnalysisTemplate"
 // mustBuild returns Build's objects for sc, failing the test if Build returns an error.
 func mustBuild(t *testing.T, sc *platformv1alpha1.ServiceClaim) []client.Object {
 	t.Helper()
-	objects, err := Build(sc)
+	objects, err := Build(sc, nil)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestBuildRejectsSLIsThatCannotBecomeRules(t *testing.T) {
 	sc.Spec.SLI.Type = platformv1alpha1.SLIHTTPLatency
 	sc.Spec.SLI.LatencyThreshold = "soon"
 
-	if objects, err := Build(sc); err == nil {
+	if objects, err := Build(sc, nil); err == nil {
 		t.Errorf("Build() returned %d objects and no error for latencyThreshold %q", len(objects), "soon")
 	}
 }
