@@ -264,6 +264,15 @@ Buckets are kept by design, and yours to empty and delete.
   and records the budget and burn rate. If Prometheus can't answer, it fails open: `SLOHealthy` is
   `Unknown`, nothing is guessed, and resources are still reconciled
   ([ADR-014](DECISIONS.md#adr-014-when-prometheus-cant-answer-the-controller-fails-open)).
+
+  ![Prometheus rule health filtered to url-shortener: the url-shortener.sli group with seven SLI recording rules and the url-shortener.slo-alerts group with four SLOErrorBudgetBurn alerts, all OK](docs/screenshots/prometheus-slo-rules.png)
+
+  *The rules generated from url-shortener's claim, loaded and healthy in Prometheus.*
+
+  ![Grafana dashboard generated for url-shortener: request rate by status code, error ratio against the 0.5% objective, latency p50, p95 and p99, and 70.0% of the error budget remaining](docs/screenshots/grafana-claim-dashboard.png)
+
+  *url-shortener's generated dashboard after 8 minutes of test traffic with 0.15% errors, against a 0.5% error budget.*
+
 - **Decide.** `DeploysFrozen` is set with hysteresis, and a validating webhook rejects image changes
   while it is `True`, unless the change carries a new break-glass reason. `Ready` means every resource
   is applied and the Rollout is healthy at its current generation.
@@ -274,6 +283,15 @@ Buckets are kept by design, and yours to empty and delete.
   the operator and every claim from git
   ([ADR-021](DECISIONS.md#adr-021-ci-scans-the-operator-image-before-anything-can-publish-it),
   [ADR-023](DECISIONS.md#adr-023-argo-cd-delivers-the-operator-and-the-claims-from-git-as-an-app-of-apps)).
+
+  ![GitHub Actions job on the demo/trivy-catch branch: every test step passes, Scan the image with Trivy fails, and Push to GHCR is skipped](docs/screenshots/ci-trivy-blocks-image.png)
+
+  *CI on the `demo/trivy-catch` branch: the scan fails, so the vulnerable image is never pushed.*
+
+  ![Argo CD applications: paved, paved-operator and platform-claims, all Healthy and Synced from github.com/singha105/paved at main](docs/screenshots/argocd-app-of-apps.png)
+
+  *The app-of-apps in Argo CD: the root app, and the operator and claims apps it creates, each synced from `main`.*
+
 - **Storage.** A claim with `storage: true` gets an ACK `Role` and `Bucket`, applied like everything
   else. The role trusts only that claim's service account and is capped by a permissions boundary.
   Its pods assume it with a projected token that AWS verifies against the cluster's public issuer,
@@ -297,7 +315,7 @@ deploy/              what Argo CD applies: the app-of-apps, the operator overlay
 services/shortlink/  the second service: a URL shortener in its own module
 examples/testsvc/    the test service behind url-shortener and webhook-delivery
 demo/                demo scripts and their asciinema recordings
-docs/                runbooks the alerts link to, and the demo GIFs
+docs/                runbooks the alerts link to, the demo GIFs and the screenshots
 system-design/       high-level design (HLD.md) and low-level design (LLD.md)
 hack/                cluster bootstrap, make demo, image scripts
 infra/aws/           Terraform for the optional AWS link: public issuer, OIDC provider, boundary, ACK roles
