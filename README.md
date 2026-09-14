@@ -1,287 +1,244 @@
 # paved
 
-An internal developer platform built as a Kubernetes operator. A developer writes one short
-`ServiceClaim`; the controller turns it into a production-shaped service and keeps it that way.
+**Every team that ships a service to Kubernetes rebuilds the same production scaffolding by hand:
+resource limits, probes, autoscaling, a disruption budget, network policy, SLO alerts, a dashboard, a
+runbook, a canary. Each copy drifts, nobody measures whether the service is meeting its SLO, and
+nothing stops a team from shipping into an outage it is already having.** paved is an internal
+developer platform built as a Kubernetes operator. A team writes one short `ServiceClaim`; paved turns
+it into all of that, keeps it that way, reads the service's error budget from Prometheus, freezes
+deploys when the budget is gone, and aborts a bad release halfway through its canary.
+
+This is the whole of what a team wrote to onboard [`shortlink`](services/shortlink), a URL shortener
+with its own code and image: 18 lines.
 
 ```yaml
 apiVersion: platform.paved.dev/v1alpha1
 kind: ServiceClaim
 metadata:
-  name: url-shortener
+  name: shortlink
   namespace: platform-claims
 spec:
-  owner: team-links
-  image: k3d-paved-registry:5001/testsvc:0.1.1
+  owner: team-growth
+  image: k3d-paved-registry:5001/shortlink:0.1.0
   port: 8080
-  tier: public
+  tier: internal
   sli:
     type: http-availability
   slo:
-    objective: "99.5"
+    objective: "99.9"
     window: 28d
   scale:
     min: 2
-    max: 5
+    max: 4
 ```
 
-The project is being built in stages. [PROGRESS.md](PROGRESS.md) records what works so far and
-the output that proves it; [DECISIONS.md](DECISIONS.md) explains the non-obvious choices.
+Committed to git, those lines became, in namespace `svc-shortlink`:
 
-## What a claim becomes
+- **A Rollout** (Argo Rollouts) running the image as non-root, read-only, without capabilities, with
+  fixed resources and probes, released as a canary: 20% of pods, 2 minutes, 50%, 2 minutes, 100%.
+- **An AnalysisTemplate** that reads the service's error ratio every 30 seconds during a canary and
+  aborts it above 5%.
+- **A Service, a HorizontalPodAutoscaler** (2 to 4 replicas at 70% CPU) and **a PodDisruptionBudget**.
+- **A NetworkPolicy** that admits only its own namespace, the platform and Prometheus.
+- **A ServiceMonitor, and a PrometheusRule** with 7 SLI recording rules and 4 multi-window burn-rate
+  alerts derived from the 99.9% objective.
+- **A Grafana dashboard and a runbook**, as ConfigMaps.
+- **A ServiceAccount, and the namespace itself**, which is deleted with the claim.
+- **A status on the claim**: error budget remaining, 1h burn rate, whether deploys are frozen,
+  whether it is ready. **A deploy policy**: image changes rejected while the budget is exhausted.
 
-Each claim is reconciled into its own namespace, `svc-<name>`. The controller server-side
-applies every object on each reconcile, puts back anything deleted or edited, and deletes the
-namespace when the claim is deleted.
+It was `Ready=True` 7 seconds after the claim file was created, with no ticket and no `kubectl apply`.
 
-| Object | public | internal | batch |
-|---|---|---|---|
-| Namespace, ServiceAccount, Argo Rollout (canary), NetworkPolicy | yes | yes | yes |
-| AnalysisTemplate: the SLI check that can abort a canary | yes | yes | no |
-| PrometheusRule: SLI recording rules and burn-rate alerts | yes | yes | yes |
-| ServiceMonitor, Grafana dashboard, runbook | yes | yes | yes |
-| Service, HorizontalPodAutoscaler, PodDisruptionBudget | yes | yes | no |
-| Ingress (`<name>.localhost` through Traefik) | yes | no | no |
+## Architecture
 
-Developers cannot set resource limits, security context, rollout strategy, probes or canary
-steps. Those belong to the platform ([ADR-001](DECISIONS.md#adr-001-developers-cannot-set-limits-security-context-rollout-strategy-probes-or-canary-steps)).
-
-## Service contract
-
-The platform measures every service the same way, so every service must expose the same
-metrics. **This is the one thing a service must do to be onboarded.**
-
-Serve Prometheus metrics at `/metrics` on the claim's `port`, including:
-
-- **`http_requests_total`**: a counter of HTTP requests, with the status code in a label named
-  `code` (for example `code="500"`). Every claim needs it. For `http-availability`, a request
-  is bad when its code is not in the claim's `sli.goodStatuses`.
-- **`http_request_duration_seconds`**: a histogram of request latency in seconds. Claims using
-  `http-latency` need it, with a bucket at exactly their `sli.latencyThreshold` (the default
-  250ms needs a bucket at 0.25). A request is bad when it takes longer than the threshold.
-
-Create the series for every status code the service returns, successes and failures, at zero when
-it starts. Prometheus's `rate()` can't see the increase that creates a series, so without this the
-first failures after each start would not count against the SLO
-([ADR-020](DECISIONS.md#adr-020-services-create-their-request-series-at-zero-when-they-start)).
-
-Don't count health checks or scrapes in these metrics; they would make the service look
-healthier than it is. The platform also expects `/healthz` and `/readyz` on the same port, and
-runs the container as UID 65532 with a read-only root filesystem.
-
-Go services get all of this from `prometheus/client_golang`'s `promhttp.InstrumentHandlerCounter`
-and `promhttp.InstrumentHandlerDuration`. [`examples/testsvc`](examples/testsvc/main.go) is a
-complete example.
-
-## How SLOs are enforced
-
-From the claim's SLI and objective, the controller generates:
-
-- **Recording rules** for the SLI error ratio over 5m, 30m, 1h, 2h, 6h, 1d and 3d, named
-  `sli:http_availability:error_ratio_rate5m` (or `sli:http_latency:...`) and labelled
-  `service`, `owner` and `tier`.
-- **Four burn-rate alerts** (`SLOErrorBudgetBurn`) from the Google SRE Workbook. Each fires only
-  when both of its windows are burning the error budget faster than its threshold:
-
-  | Severity | Burn rate | Long window | Short window |
-  |---|---|---|---|
-  | page | 14.4 | 1h | 5m |
-  | page | 6 | 6h | 30m |
-  | ticket | 3 | 1d | 2h |
-  | ticket | 1 | 3d | 6h |
-
-- **A Grafana dashboard** with request rate, error ratio against the objective, latency
-  percentiles and error budget remaining, plus a **runbook** ConfigMap. The alerts link to
-  [docs/runbooks/slo-burn-rate.md](docs/runbooks/slo-burn-rate.md).
-
-## What the controller reports
-
-Every minute, the controller reads each claim's error ratio from Prometheus and records it in
-the claim's status:
-
-- **`errorBudgetRemaining`** (the BUDGET column): the share of the error budget left over the
-  SLO window, `clamp(1 - errorRatio / (1 - objective), 0, 1)`.
-- **`burnRate1h`**: how fast the last hour spent it. At 1, the whole budget would last exactly
-  the SLO window.
-- **`SLOHealthy`**: `True` while budget remains; `False` when it is used up
-  (`BudgetExhausted`) or the last hour burned at 14.4x or faster (`FastBurn`); `Unknown` when
-  there is no traffic or Prometheus can't be reached.
-
-```text
-$ kubectl get serviceclaims -A
-NAMESPACE         NAME               TIER     OWNER               BUDGET   FROZEN   READY   AGE
-platform-claims   url-shortener      public   team-links          39.8%    False    True    16h
-platform-claims   webhook-delivery   public   team-integrations   100.0%   False    True    16h
+```mermaid
+flowchart LR
+    claim["ServiceClaim<br/>committed to git,<br/>applied by Argo CD"] --> reconciler["Reconciler<br/>server-side apply,<br/>drift put back"]
+    reconciler --> resources["Managed resources<br/>Rollout, HPA, PDB,<br/>NetworkPolicy, ServiceMonitor,<br/>PrometheusRule, dashboard"]
+    resources --> prometheus["Prometheus<br/>scrapes http_requests_total,<br/>records the SLI error ratio"]
+    prometheus --> burn["Error budget<br/>and burn rate"]
+    burn --> status["Claim status<br/>BUDGET, FROZEN, READY"]
+    status --> webhook["Admission webhook"]
+    webhook --> decision{"Image change:<br/>ship or reject?<br/>(break-glass audited)"}
+    prometheus --> analysis["Canary analysis<br/>same recording rule"]
+    analysis --> canary{"Canary:<br/>continue or abort?"}
+    prometheus --> alerts["Burn-rate alerts<br/>page or ticket"]
 ```
 
-Here `url-shortener` has spent 60% of its budget on requests the freeze demo sent to `/boom`, which
-always fails.
-
-If Prometheus is unreachable, the controller fails open: `SLOHealthy` becomes `Unknown`, the
-budget is left blank rather than guessed, and resources are still reconciled
-([ADR-014](DECISIONS.md#adr-014-when-prometheus-cant-answer-the-controller-fails-open)).
-
-The controller also heals drift. Delete or edit an object it manages and the next reconcile puts
-it back, recording a `DriftCorrected` Event on the claim
-([ADR-015](DECISIONS.md#adr-015-drift-is-detected-from-the-controllers-own-field-ownership)).
-[`demo/02-drift.cast`](demo/02-drift.cast) records a deleted PrometheusRule coming back. In five
-measured runs on a local k3d cluster, the rule was back 65 to 99 ms after `kubectl delete`
-returned (median 78 ms).
-
-## How deploys freeze
-
-The error budget decides whether a service may ship. Every minute the controller sets the claim's
-`DeploysFrozen` condition, the FROZEN column:
-
-- **`True` (`BudgetExhausted`)** as soon as no error budget is left.
-- **Still `True` (`BudgetRecovering`)** until 5% of the budget is back, so a service hovering at
-  zero can't flip between frozen and unfrozen
-  ([ADR-017](DECISIONS.md#adr-017-deploys-freeze-when-the-budget-is-gone-and-unfreeze-only-at-5)).
-- **`False`** otherwise. When the budget can't be measured, the last decision stands.
-
-A validating admission webhook enforces it. While `DeploysFrozen` is `True`, an update that changes
-`spec.image` is rejected. Every other change, such as scaling, is admitted
-([ADR-018](DECISIONS.md#adr-018-the-webhook-rejects-only-image-changes-and-break-glass-must-be-set-in-the-same-update)).
-From [`demo/03-freeze.cast`](demo/03-freeze.cast), with the command wrapped:
-
-```text
-$ kubectl patch serviceclaim url-shortener -n platform-claims --type merge \
-    -p '{"spec":{"image":"k3d-paved-registry:5001/testsvc:0.2.0"}}'
-Error from server (Forbidden): admission webhook "vserviceclaim-v1alpha1.paved.dev" denied the request: deploys frozen: url-shortener has 0% error budget remaining in a 28d window (burn rate 1.0x). Override with annotation paved.dev/break-glass="<reason>" — this is audited.
-```
-
-In an emergency, set a reason in the same update that changes the image. The change goes through
-with a warning, and a `BreakGlassUsed` Event records who made it and why. From the recording, with
-the Events of earlier demo runs left out:
-
-```text
-$ kubectl patch serviceclaim url-shortener -n platform-claims --type merge \
-    -p '{"metadata":{"annotations":{"paved.dev/break-glass":"INC-1234: hotfix for the 500s"}},"spec":{"image":"k3d-paved-registry:5001/testsvc:0.1.2"}}'
-Warning: deploys are frozen: this image change was let through by paved.dev/break-glass and recorded in a BreakGlassUsed Event
-serviceclaim.platform.paved.dev/url-shortener patched
-
-$ kubectl get events -n platform-claims --field-selector reason=BreakGlassUsed
-LAST SEEN   TYPE      REASON           OBJECT                       MESSAGE
-0s          Warning   BreakGlassUsed   serviceclaim/url-shortener   system:admin changed the image from k3d-paved-registry:5001/testsvc:0.1.1 to k3d-paved-registry:5001/testsvc:0.1.2 during a deploy freeze: INC-1234: hotfix for the 500s
-```
-
-A reason left on the claim won't carry a later image change through, so every override needs its
-own. The webhook's failure policy is `Fail`: if it can't be reached, ServiceClaim writes are
-rejected rather than let through.
-
-[`demo/03-freeze.cast`](demo/03-freeze.cast) records the whole arc. Errors spend url-shortener's
-budget and deploys freeze. A release is rejected, and a hotfix ships with break-glass. Then the
-errors stop, the budget recovers, and the same release ships. Replay it with
-`asciinema play demo/03-freeze.cast`, or run it yourself with [`demo/freeze-demo.sh`](demo/freeze-demo.sh).
-
-`Ready` is `True` when every managed resource is applied and Argo Rollouts reports the Rollout
-healthy at its current generation, so it is `False` during a canary
-([ADR-019](DECISIONS.md#adr-019-ready-means-every-resource-is-applied-and-the-rollout-is-healthy)).
-
-## How releases ship
-
-The platform is delivered the same way it delivers services.
-
-**CI** ([`.github/workflows/ci.yaml`](.github/workflows/ci.yaml)) runs `go vet`, the unit tests and
-envtest, builds the operator image and scans it with Trivy. A HIGH or CRITICAL vulnerability that
-has a fix fails the run before anything is pushed, and only `main` publishes, to
-`ghcr.io/singha105/paved`
-([ADR-021](DECISIONS.md#adr-021-ci-scans-the-operator-image-before-anything-can-publish-it)). The
-branch [`demo/trivy-catch`](https://github.com/singha105/paved/tree/demo/trivy-catch) builds on
-`alpine:3.14.0` to show the gate working. Its
-[run failed at the Trivy step](https://github.com/singha105/paved/actions/runs/34807296384) with 38
-HIGH or CRITICAL vulnerabilities that have fixes (4 CRITICAL) and pushed nothing. Its parent
-commit, on main, [passed and published](https://github.com/singha105/paved/actions/runs/34807295309).
-
-**Argo CD** applies the platform from git as an app-of-apps
-([ADR-023](DECISIONS.md#adr-023-argo-cd-delivers-the-operator-and-the-claims-from-git-as-an-app-of-apps)).
-`deploy/argocd/root.yaml` creates two Applications: `paved-operator` runs the scanned image pinned in
-[`deploy/operator`](deploy/operator/kustomization.yaml), and `platform-claims` applies every claim in
-[`deploy/claims`](deploy/claims). A claim changes by commit, and Argo CD puts back any edit made with
-`kubectl`.
-
-**Argo Rollouts** ships each new image as a canary: 20% of the pods, a 2-minute pause, 50%, another
-2 minutes, then all of them. From the first pause, an AnalysisTemplate the controller generates for
-the claim reads `sli:http_availability:error_ratio_rate5m` every 30 seconds. The first reading above
-5% aborts the rollout, and the stable version keeps serving
+The error ratio Prometheus records for a claim has three jobs: it pages people when the budget burns
+too fast, it freezes deploys when the budget is gone, and it aborts a canary that makes it worse.
+Measurement is defined once, per service, so alerting, release policy and rollback can never disagree
+about whether a service is healthy
 ([ADR-022](DECISIONS.md#adr-022-the-canary-is-gated-on-the-same-sli-recording-rule-as-the-alerts-and-the-freeze)).
 
-That recording rule is the same one the burn-rate alerts and the deploy freeze read. **One SLI does
-three jobs:** it pages people when the error budget burns, it freezes deploys when the budget is
-gone, and it stops a bad release halfway through its canary. A service's measurement is defined
-once, so alerting, release policy and rollback can never disagree about whether it is healthy.
+## The demos
 
-[`demo/04-canary.cast`](demo/04-canary.cast) records a release that fails every request going out
-as a commit to `main`. Argo CD applies it, the canary starts, and the analysis aborts it with nobody
-touching the cluster. Reverting the commit brings the good version back. In the recording and two
-more runs on a local k3d cluster, the canary was aborted 62, 63 and 63 seconds after the bad image
-reached the Rollout, measured from paved's apply of the image to the Rollout's `abortedAt`. Each time
-the analysis passed its first two readings and failed the third, 60 seconds after it started.
+Each GIF links to its asciinema recording (`asciinema play demo/<name>.cast`). They were recorded
+unattended from the scripts in [`demo/`](demo) on a local k3d cluster.
 
-## Run it locally
+### 3. The error budget runs out, and deploys freeze
 
-Requires Docker, k3d, kubectl, Helm and Go. The demos also need ApacheBench (`ab`) and the
-[`kubectl argo rollouts`](https://github.com/argoproj/argo-rollouts/releases/tag/v1.10.0) plugin.
-Versions used are pinned in [PROGRESS.md](PROGRESS.md).
+[![Demo 3: url-shortener's error budget runs out, an image bump is rejected, a break-glass hotfix ships, the budget recovers and the bump ships](docs/casts/03-freeze.gif)](demo/03-freeze.cast)
+
+Errors spend url-shortener's budget until the controller freezes its deploys. The next image bump is
+rejected by the webhook, with the budget, window and burn rate in the message. An urgent hotfix goes
+out with a break-glass reason and is recorded in a `BreakGlassUsed` Event. The errors stop, the budget
+comes back past 5%, and the same bump ships. [`demo/freeze-demo.sh`](demo/freeze-demo.sh)
+
+### 2. Drift is put back
+
+[![Demo 2: a managed PrometheusRule is deleted and the controller recreates it](docs/casts/02-drift.gif)](demo/02-drift.cast)
+
+Someone deletes a PrometheusRule paved manages. The controller notices through its watch, applies it
+again, and records a `DriftCorrected` Event on the claim. [`demo/02-drift.sh`](demo/02-drift.sh)
+
+### 1. A second service is onboarded with one file
+
+[![Demo 1: the shortlink claim is written, committed and becomes a running, Ready service](docs/casts/01-onboard.gif)](demo/01-onboard.cast)
+
+The claim above is created, committed and pushed. Argo CD applies it, paved builds the service, and
+the claim reports `Ready=True`. The demo then lists what it became and follows a short link through
+it. [`demo/onboard-demo.sh`](demo/onboard-demo.sh)
+
+### 4. A bad release is aborted mid-canary
+
+[![Demo 4: a release that fails every request is committed, its canary is aborted by the SLI analysis, and the commit is reverted](docs/casts/04-canary.gif)](demo/04-canary.cast)
+
+A release that fails every request goes out the normal way, as a commit. At its first pause, the
+analysis reads an error ratio over 5% and Argo Rollouts aborts the canary with nobody touching the
+cluster; the stable version never stops serving. Reverting the commit brings git back in line.
+[`demo/canary-demo.sh`](demo/canary-demo.sh)
+
+## Measured results
+
+Every number here was measured on this project's local k3d cluster (k3s v1.36.4 on Docker Desktop,
+Apple silicon); how each was taken is recorded in [PROGRESS.md](PROGRESS.md).
+
+| What | Result | How it was measured |
+|---|---|---|
+| Onboarding a second service | **7 s** from creating the claim file to `Ready=True` | `demo/onboard-demo.sh`: the file's creation to the claim's `Ready` transition. Its image was already built and pushed (24 s); typing the claim by hand is not included. |
+| YAML the team wrote | **18 lines** | Non-blank, non-comment lines of `deploy/claims/shortlink.yaml` |
+| Drift restore | **median 188 ms** (100 to 257 ms over 5 runs) | A deleted PrometheusRule: from `kubectl delete` returning to the watch's `ADDED` event, controller running in the cluster |
+| Canary abort | **62 s, 63 s, 63 s** (median 63 s) | From paved applying the bad image to the Rollout to the Rollout's `abortedAt`, in the recording and two more runs |
+| Reconcile p95 | **494 ms** (median 192 ms) | `controller_runtime_reconcile_time_seconds` on the in-cluster controller: 95 reconciles over 10 minutes, covering three claims' one-minute refreshes, shortlink's onboarding and five drift restores; interpolated inside the 450 to 500 ms bucket |
+| Tests | **105**, all passing | `go test -v`: 76 Go tests (71 in the operator module, envtest included and the Kind e2e suite excluded, and 5 in `services/shortlink`) and 29 Ginkgo specs (11 controller, 12 webhook, and the 6 in `test/`) |
+
+## What you cannot configure, and why
+
+A claim has fields for what a team knows best: who owns the service, what it runs, how it is
+measured, what it promises and how far it scales. Everything else is the golden path, the same for
+every service, and not in the API at all
+([ADR-001](DECISIONS.md#adr-001-developers-cannot-set-limits-security-context-rollout-strategy-probes-or-canary-steps)).
+
+| You can't set | paved decides | Why |
+|---|---|---|
+| CPU and memory | Requests 50m and 64Mi, limits 250m and 128Mi | Capacity and cost stay predictable, and one noisy service can't starve its neighbours. A service that needs more is a platform change, made once. |
+| Security context | UID 65532, read-only root filesystem, no capabilities, `RuntimeDefault` seccomp | Every service gets the same baseline. An exception would be reviewed once, not rediscovered in each manifest. |
+| Probes | `/readyz` for readiness, `/healthz` for liveness, on the claim's port | Canaries, the PDB and the Service all trust readiness, so it has to mean the same thing everywhere. |
+| Rollout strategy and canary steps | Canary, 20%, 2 min, 50%, 2 min, 100% | The analysis needs pauses long enough to see a bad release before it is promoted ([ADR-022](DECISIONS.md#adr-022-the-canary-is-gated-on-the-same-sli-recording-rule-as-the-alerts-and-the-freeze)). |
+| Canary abort threshold | A 5m error ratio above 5% | One definition of "broken", shared with alerting and the freeze. |
+| Alert thresholds | Four burn-rate alerts: 14.4x and 6x page, 3x and 1x ticket | Paging means the same thing for every team; the thresholds come from the objective, not taste. |
+| Replica floor, autoscaling, disruption | Public runs at least 2 replicas; HPA at 70% CPU; at most one pod down at a time | An availability baseline per tier ([ADR-008](DECISIONS.md#adr-008-the-hpa-owns-the-replica-count-and-tier-floors-never-produce-an-invalid-object)). |
+| Network policy | Ingress only from its own namespace, the platform and Prometheus, plus Traefik for public | Nothing is reachable by accident, and nothing can widen it by accident ([ADR-007](DECISIONS.md#adr-007-networkpolicy-lets-prometheus-in-and-leaves-egress-open)). |
+| Namespace | `svc-<name>`, deleted with the claim | Everything a claim owns is in one place and goes when the claim goes ([ADR-006](DECISIONS.md#adr-006-managed-objects-are-tied-to-their-claim-by-labels-and-a-finalizer-not-owner-references)). |
+| Deploy freeze | Freeze at 0% budget, unfreeze at 5%, break-glass per change | Shipping into an outage stops, without trapping the fix ([ADR-017](DECISIONS.md#adr-017-deploys-freeze-when-the-budget-is-gone-and-unfreeze-only-at-5), [ADR-018](DECISIONS.md#adr-018-the-webhook-rejects-only-image-changes-and-break-glass-must-be-set-in-the-same-update)). |
+
+What a claim does have: `owner`, `image`, `port`, `tier` (public, internal or batch), `sli.type`
+(`http-availability`, with `goodStatuses`, or `http-latency`, with `latencyThreshold`),
+`slo.objective` and `slo.window`, and `scale.min` and `scale.max`.
+
+## The service contract
+
+The platform measures every service the same way, so every service must expose the same metrics.
+**This is the one thing a service must do to be onboarded.** Serve Prometheus metrics at `/metrics` on
+the claim's `port`:
+
+- **`http_requests_total`**: a counter of HTTP requests with the status code in a label named `code`.
+  For `http-availability`, a request is bad when its code is not in `sli.goodStatuses` (by default
+  200, 201, 204, 301, 302, 304, 400 and 404).
+- **`http_request_duration_seconds`**: a histogram of latency in seconds, for `http-latency`, with a
+  bucket at exactly the claim's `sli.latencyThreshold` (250ms by default).
+- **Create the series for every status code you return, at zero, before serving.** Prometheus's
+  `rate()` can't see the increase that creates a series, so otherwise the first failures after every
+  start never count. That bug is the subject of [POSTMORTEM.md](POSTMORTEM.md).
+- **Count only application requests,** not probes or scrapes, and serve `/healthz` and `/readyz` on
+  the same port. The container runs as UID 65532 with a read-only root filesystem.
+
+Go services get the metrics from `prometheus/client_golang`'s `promhttp.InstrumentHandlerCounter` and
+`InstrumentHandlerDuration`; [`services/shortlink`](services/shortlink) is a complete example with a
+test that fails if a series is missing.
+
+## Quickstart
+
+Requires Docker, [k3d](https://k3d.io), kubectl, Helm and curl. The demos also need ApacheBench (`ab`)
+and the [`kubectl argo rollouts`](https://github.com/argoproj/argo-rollouts/releases/tag/v1.10.0)
+plugin. Versions used are pinned in [PROGRESS.md](PROGRESS.md).
 
 ```bash
-./hack/cluster-up.sh        # k3d cluster, local registry, platform stack, Argo CD and its root app
-./hack/testsvc-image.sh     # build and push the test service the example claims run
-kubectl get applications -n argocd
-kubectl get serviceclaims -n platform-claims
-curl http://url-shortener.localhost/boom    # returns 500; counts against the SLO
+git clone https://github.com/singha105/paved.git
+cd paved
+make demo
 ```
 
-Argo CD reads this repository on GitHub, so the cluster runs what is on `main`: the operator image
-CI published and the claims in [`deploy/claims`](deploy/claims). To change a claim, commit and push
-it. Argo CD checks git periodically; to make it check now:
+`make demo` creates a k3d cluster and a local registry, installs cert-manager, Traefik, Argo Rollouts,
+kube-prometheus-stack and Argo CD, pushes the images the example claims run, and hands the platform to
+Argo CD, which deploys the operator image CI published and the claims in
+[`deploy/claims`](deploy/claims). It returns when every claim is Ready. Verified from a clean clone on the Mac this was built on: with the cluster and its registry deleted first, `make demo` finished in **210 seconds**. Docker's build cache and Helm's chart cache were warm; every image inside the cluster was pulled fresh. A claim can show `READY False` for a few seconds after it returns, while its autoscaler adds a second pod.
+
+Then run any demo, for example `./demo/02-drift.sh` or `./demo/freeze-demo.sh`. The canary and
+onboarding demos commit and push to `main`, so run them from your own fork. To remove everything:
 
 ```bash
-kubectl annotate application platform-claims -n argocd argocd.argoproj.io/refresh=normal --overwrite
+k3d cluster delete paved && k3d registry delete k3d-paved-registry
 ```
 
-The demos ship more tags of the test service. Push them, then run either demo:
+## How it works
 
-```bash
-TAG=0.1.2 ./hack/testsvc-image.sh
-TAG=0.2.0 ./hack/testsvc-image.sh
-BROKEN=true TAG=0.2.1-bad ./hack/testsvc-image.sh
-./demo/freeze-demo.sh       # pauses Argo CD's automated sync while it patches the claim
-./demo/canary-demo.sh       # commits and pushes to main twice: the bad release, then its revert
-```
-
-`make docker-build deploy` still builds a local controller into k3d and deploys it
-([ADR-016](DECISIONS.md#adr-016-the-controller-runs-in-the-cluster-and-make-docker-build-loads-it-into-k3d)),
-but Argo CD replaces it with the image pinned in git.
-
-`make run` starts the controller on your machine instead, without the webhook, so nothing enforces
-deploy freezes. It also can't reach Prometheus's in-cluster address; forward the port and point
-the controller at it:
-
-```bash
-kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9090:9090
-```
-
-```bash
-ENABLE_WEBHOOKS=false go run ./cmd/main.go --prometheus-url=http://localhost:9090
-```
+- **Reconcile.** The controller server-side applies every object a claim's tier needs with one field
+  owner, and compares that owner's field set before and after to tell a drift correction from a no-op
+  ([ADR-002](DECISIONS.md#adr-002-server-side-apply-with-one-field-owner-for-everything-the-controller-writes),
+  [ADR-015](DECISIONS.md#adr-015-drift-is-detected-from-the-controllers-own-field-ownership)). Children
+  live in another namespace, so they are tied to the claim with labels and a finalizer rather than
+  owner references.
+- **Measure.** Every minute it reads the claim's error ratio over its SLO window and the last hour,
+  and records the budget and burn rate. If Prometheus can't answer, it fails open: `SLOHealthy` is
+  `Unknown`, nothing is guessed, and resources are still reconciled
+  ([ADR-014](DECISIONS.md#adr-014-when-prometheus-cant-answer-the-controller-fails-open)).
+- **Decide.** `DeploysFrozen` is set with hysteresis, and a validating webhook rejects image changes
+  while it is `True`, unless the change carries a new break-glass reason. `Ready` means every resource
+  is applied and the Rollout is healthy at its current generation.
+- **Deliver.** CI tests the operator, builds its image and fails on fixable HIGH or CRITICAL
+  vulnerabilities before pushing to GHCR; the
+  [`demo/trivy-catch`](https://github.com/singha105/paved/tree/demo/trivy-catch) branch shows the
+  [scan failing a build](https://github.com/singha105/paved/actions/runs/34807296384). Argo CD applies
+  the operator and every claim from git
+  ([ADR-021](DECISIONS.md#adr-021-ci-scans-the-operator-image-before-anything-can-publish-it),
+  [ADR-023](DECISIONS.md#adr-023-argo-cd-delivers-the-operator-and-the-claims-from-git-as-an-app-of-apps)).
+- **Why an operator at all.** A Helm chart renders once; paved keeps objects as declared, reports
+  status, and makes deploy decisions from live data
+  ([ADR-024](DECISIONS.md#adr-024-paved-is-an-operator-not-a-helm-chart)).
 
 ## Repository layout
 
 ```
-.github/workflows/   CI (tests, image build, Trivy scan, GHCR push), lint, e2e
 api/v1alpha1/        ServiceClaim types
 cmd/main.go          controller manager
 internal/builders/   one pure function per managed object
 internal/slo/        error budgets, recording rules, burn-rate alerts
 internal/controller/ reconciler: resources, drift, error budget, deploy freeze, Ready
 internal/webhook/    admission webhook: rejects image changes during a freeze, audits break-glass
+test/                envtest suite (six specs), e2e suite, third-party CRDs for tests
 deploy/              what Argo CD applies: the app-of-apps, the operator overlay, the claims
-examples/testsvc/    the test service the example claims run
+services/shortlink/  the second service: a URL shortener in its own module
+examples/testsvc/    the test service behind url-shortener and webhook-delivery
 demo/                demo scripts and their asciinema recordings
-docs/runbooks/       runbooks the alerts link to
-hack/                cluster bootstrap and image scripts
-test/                e2e suite and third-party CRDs for tests
+docs/                runbooks the alerts link to, and the demo GIFs
+hack/                cluster bootstrap, make demo, image scripts
 ```
+
+**Read next:** [DECISIONS.md](DECISIONS.md) for why each piece is the way it is,
+[POSTMORTEM.md](POSTMORTEM.md) for the worst bug of the week, and [PROGRESS.md](PROGRESS.md) for the
+day-by-day build with the output that proves each step.
 
 ## License
 

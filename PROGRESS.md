@@ -8,6 +8,7 @@
 | 4 | Error budget in status, drift correction | Done 2026-09-13 |
 | 5 | Admission webhook: freeze deploys on budget exhaustion | Done 2026-09-13 |
 | 6 | CI/CD, GitOps, image scanning, canary auto-rollback | Done 2026-09-14 |
+| 7 | envtest suite, second service, documentation | Done 2026-09-14 |
 
 ## BLOCKED
 
@@ -913,3 +914,170 @@ Extra checks beyond the acceptance list:
   app to make it check immediately.
 - Still open from earlier days: claim name and namespace validation, ingress TLS, the batch tier's
   ServiceMonitor, and the `platform-system` namespace in managed NetworkPolicies.
+
+---
+
+## Day 7: envtest suite, second service, documentation
+
+Agreed with the user before building (2026-09-14):
+- **The six envtest specs test what paved does.** Public claims get 13 objects, carrying the claim's
+  ownership labels and no owner references; batch claims get 8. The cascade spec proves paved's part,
+  deleting the namespace and holding the finalizer, and the full cascade is shown on the live cluster.
+- **Service #2 is `shortlink`.** It is a new URL shortener in `services/shortlink`, with its own
+  module and image, onboarded as tier `internal`. The existing claims stay.
+- **`make demo` is verified from a clean clone.** The paved cluster and registry are deleted and
+  rebuilt from `git clone`.
+- The proposed defaults:
+  - The casts become GIFs rendered with agg 1.9.0.
+  - The onboarding stopwatch runs from creating the claim file to `Ready=True`.
+  - Reconcile p95 comes from the controller's histogram over a 10-minute window, and drift restore
+    is re-measured in the cluster.
+  - The test count covers every test.
+  - POSTMORTEM.md covers Day 4's `rate()` bug, with guardrail tests; DECISIONS.md gets ADR-024 and a
+    break-glass section.
+  - Five commits.
+
+### Acceptance
+
+Run on 2026-09-14. Output is copied from the terminal and shortened where marked.
+
+```text
+$ make test
+(packages without tests left out)
+ok  	github.com/singha105/paved/examples/testsvc	(cached)	coverage: 37.9% of statements
+ok  	github.com/singha105/paved/internal/builders	(cached)	coverage: 90.7% of statements
+ok  	github.com/singha105/paved/internal/controller	7.299s	coverage: 89.1% of statements
+ok  	github.com/singha105/paved/internal/slo	(cached)	coverage: 93.0% of statements
+ok  	github.com/singha105/paved/internal/webhook/v1alpha1	7.875s	coverage: 95.1% of statements
+ok  	github.com/singha105/paved/test	12.947s	coverage: [no statements]
+
+# The six envtest specs in test/, from `go test ./test/ -v -ginkgo.v`
+ServiceClaim controller tier: public produces exactly 13 resources, labelled as the claim's, with no owner references
+ServiceClaim controller tier: batch produces 8, and no Service or Ingress
+ServiceClaim controller drift: a deleted managed PrometheusRule is recreated
+ServiceClaim controller idempotency: reconciling twice changes no managed object's resourceVersion
+ServiceClaim controller cascade: deleting the claim deletes its namespace, and the finalizer holds the claim until it is gone
+ServiceClaim controller status: observedGeneration tracks metadata.generation after a spec edit
+Ran 6 of 6 Specs in 12.999 seconds
+--- PASS: TestPaved (13.00s)
+
+# First, the existing cluster and registry were deleted
+$ k3d cluster delete paved && k3d registry delete k3d-paved-registry
+paved containers left: 0
+
+$ git clone https://github.com/singha105/paved.git /tmp/clean && cd /tmp/clean && make demo
+cloned at 5bf458c
+==> Creating the cluster, its registry and the platform stack (hack/cluster-up.sh)
+==> Creating registry 'k3d-paved-registry' on localhost:5001
+==> Creating cluster 'paved' (rancher/k3s:v1.36.4-k3s1)
+(Helm output for cert-manager, Traefik, Argo Rollouts, kube-prometheus-stack and Argo CD left out)
+==> Cluster 'paved' is ready (kubectl context: k3d-paved, registry: localhost:5001)
+==> Pushing the images the example claims and the demos run
+==> Handing the platform to Argo CD (deploy/argocd/root.yaml)
+    waiting until Argo CD has synced the operator and the claims from git
+    waiting until every claim in deploy/claims is Ready
+==> paved is up, in 209s
+NAME              SYNC STATUS   HEALTH STATUS
+paved             Synced        Healthy
+paved-operator    Synced        Healthy
+platform-claims   Synced        Healthy
+NAME               TIER       OWNER               BUDGET   FROZEN   READY   AGE
+shortlink          internal   team-growth                  False    False   20s
+url-shortener      public     team-links                   False    True    20s
+webhook-delivery   public     team-integrations            False    True    20s
+make demo exit 0 after 210 s
+
+$ ls demo/*.cast
+demo/01-onboard.cast
+demo/02-drift.cast
+demo/03-freeze.cast
+demo/04-canary.cast
+
+$ grep -c TBD README.md
+0
+```
+
+`make demo` returned once every claim had reported Ready. By the time it printed the table, shortlink
+had dropped back to `READY False` while its autoscaler added a second pod (see the notes). Two
+minutes later, all three claims were `Ready=True`: shortlink's Rollout was `Healthy` with 2 of 2
+replicas available, and its condition had been True since 17:05:13Z.
+
+Extra checks beyond the acceptance list:
+
+- **The six specs by name**, from `go test ./test/ -v -ginkgo.v`:
+  ```text
+  ServiceClaim controller tier: public produces exactly 13 resources, labelled as the claim's, with no owner references
+  ServiceClaim controller tier: batch produces 8, and no Service or Ingress
+  ServiceClaim controller drift: a deleted managed PrometheusRule is recreated
+  ServiceClaim controller idempotency: reconciling twice changes no managed object's resourceVersion
+  ServiceClaim controller cascade: deleting the claim deletes its namespace, and the finalizer holds the claim until it is gone
+  ServiceClaim controller status: observedGeneration tracks metadata.generation after a spec edit
+  Ran 6 of 6 Specs in 12.520 seconds
+  ```
+- **The cascade on the live cluster.** envtest has no namespace controller, so this was checked with a
+  temporary claim applied outside git:
+  ```text
+  managed objects in svc-cascade-proof: 11
+  pods in svc-cascade-proof: 1
+  $ kubectl delete serviceclaim cascade-proof -n platform-claims
+  claim gone after 30.2 s
+  $ kubectl get namespace svc-cascade-proof
+  Error from server (NotFound): namespaces "svc-cascade-proof" not found
+  $ kubectl get serviceaccount,rollout,analysistemplate,service,horizontalpodautoscaler,poddisruptionbudget,networkpolicy,servicemonitor,prometheusrule,configmap,pods -n svc-cascade-proof
+  No resources found in svc-cascade-proof namespace.
+  ```
+- **The onboarding works end to end.** After `Ready=True`, a link created through a port-forward
+  answered `HTTP/1.1 302 Found` with `Location: https://github.com/singha105/paved`.
+- **The guardrail tests pass.** `TestEveryStatusSeriesExistsBeforeAnyRequest` (shortlink) and
+  `TestRequestSeriesExistBeforeAnyRequest` (testsvc) both pass. CI runs shortlink's module tests in
+  their own step.
+
+### Measurements
+
+| What | Value | How measured |
+|---|---|---|
+| Onboarding shortlink | 7 s (file created 16:46:02Z, `Ready=True` 16:46:09Z) | `demo/onboard-demo.sh` in the recording: the local clock when the claim file was written, to the Ready condition's `lastTransitionTime` |
+| YAML written to onboard it | 18 lines | `grep -cvE '^[[:space:]]*(#\|$)' deploy/claims/shortlink.yaml` |
+| shortlink image build and push | 24 s | Wall clock of `hack/shortlink-image.sh` |
+| Drift restore, controller in the cluster | 188, 121, 213, 257 and 100 ms: min 100 ms, median 188 ms, max 257 ms | The watch-and-delete script from Day 4 on url-shortener's PrometheusRule, from `kubectl delete` returning to the watch's `ADDED` event, 5 runs starting 16:48:42Z |
+| Reconcile time | p50 192 ms, p95 494 ms, p99 1,631 ms, mean 252 ms, over 95 reconciles | `controller_runtime_reconcile_time_seconds{controller="serviceclaim"}` read at 16:45:16Z and 16:55:25Z through the metrics endpoint with a temporary service account (removed afterwards), and interpolated within buckets like `histogram_quantile` |
+| Tests | 105: 76 Go tests (71 in the operator module, 5 in shortlink) and 29 Ginkgo specs (11 controller, 12 webhook, 6 in `test/`), 0 failures | `go test -v`, counting top-level `--- PASS: Test` lines without the three Ginkgo suite wrappers, plus `Ran N of N Specs` |
+| Live cascade | The claim was gone 30.2 s after `kubectl delete` | Wall clock around `kubectl delete --wait` |
+| Demo GIFs | 01 779 KB, 02 124 KB, 03 2.5 MB, 04 2.2 MB | `agg --idle-time-limit 2 --last-frame-duration 5` |
+| `make demo` from a clean clone | 210 s, exit 0, cloned at `5bf458c`. Rehearsed first against the running cluster: 172 s. Docker's build cache and Helm's chart cache were warm; every image inside the new cluster was pulled fresh | Wall clock of `make demo` in `/tmp/clean` after deleting the cluster and registry |
+
+### Deviations from the spec
+
+- **Counts and ownership differ from the spec (agreed).** The specs assert 13 and 8 objects, not 11
+  and 7, and ownership labels instead of owner references. The runbook and the AnalysisTemplate were
+  added after the spec's counts were written, and owner references can't cross namespaces (ADR-006).
+- **The cascade spec finishes the namespace deletion itself**, since envtest runs no namespace
+  controller. The full cascade, with the children gone, was checked on the live cluster.
+- **`test/` needs a `suite_test.go` beside `controller_test.go`**, to start envtest and the manager.
+- **The onboarding stopwatch starts when the script writes the claim file**, not when a person opens
+  an editor. shortlink's code and image existed beforehand; building and pushing the image took 24 s,
+  measured separately.
+- **The onboarding recording added a commit to main**, `6f467db`, as a real onboarding would. The
+  first recording attempt stopped at a precondition and committed nothing. Its registry check requested
+  the image manifest with only the Docker v2 media type, and the registry stores an OCI image index,
+  so it answered 404. The fix, checking the tag list instead, is in commit 4.
+- **The README's drift restore time is the Day 7 measurement**, with the controller in the cluster
+  (median 188 ms), not Day 4's with the controller on the Mac (median 78 ms). Demo 2's cast is still
+  the Day 4 recording, which shows 72 ms.
+- **The README keeps "How it works" and "Repository layout"** after the sections the spec lists, in the
+  spec's order.
+
+### Notes for later days
+
+- **shortlink reported `Ready=True` while its Rollout ran one pod.** That was before the HPA scaled it
+  to its minimum of 2, because the Rollout leaves the replica count to the HPA (ADR-008). A new claim
+  is briefly below its tier's floor.
+- **A few reconciles took over a second** (p99 1,631 ms, against a p95 of 494 ms). The window included
+  shortlink's first reconcile, which creates 12 objects with an uncached read before each apply.
+- **The live cascade took 30 seconds**, most of it the namespace controller deleting the Rollout's pod
+  and the other objects before the finalizer could be released.
+- **`hack/cluster-up.sh` failed at `k3d cluster start --wait` this morning.** The k3s container
+  restarted 5 times after the previous day's Docker restart (its node IP had changed from 172.19.0.2 to
+  172.19.0.4), and then came up on its own.
+- **`Ready` drops to False while an autoscaler adds pods.** A new claim's Rollout starts with one pod; the HPA then scales it to its minimum, and Argo Rollouts reports `Progressing` until the new pod is ready. shortlink did this at the end of the clean-clone `make demo`. ADR-019 defines `Ready` as a healthy Rollout, so this follows the definition, but a scale event making a claim unready is worth revisiting.
+- **`demo/onboard-demo.sh` and `demo/canary-demo.sh` push to main.** From a clone, run them on a fork.

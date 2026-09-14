@@ -5,6 +5,23 @@ Each one says what was decided, why, and what it costs.
 
 ---
 
+
+## Start here
+
+paved rests on a handful of decisions. The rest of this file explains them one at a time:
+
+| Decision | Where |
+|---|---|
+| An operator, not a Helm chart | [ADR-024](#adr-024-paved-is-an-operator-not-a-helm-chart) |
+| Server-side apply with one field owner, never get-then-update loops | [ADR-002](#adr-002-server-side-apply-with-one-field-owner-for-everything-the-controller-writes) |
+| A finalizer and labels for the cluster-scoped namespace, not owner references | [ADR-006](#adr-006-managed-objects-are-tied-to-their-claim-by-labels-and-a-finalizer-not-owner-references) |
+| Fail open when metrics are missing | [ADR-014](#adr-014-when-prometheus-cant-answer-the-controller-fails-open) |
+| Freeze at an empty budget, unfreeze only at 5% | [ADR-017](#adr-017-deploys-freeze-when-the-budget-is-gone-and-unfreeze-only-at-5) |
+| Break-glass instead of a hard block | [ADR-018](#adr-018-the-webhook-rejects-only-image-changes-and-break-glass-must-be-set-in-the-same-update) |
+| One SLI for alerts, the freeze and the canary | [ADR-022](#adr-022-the-canary-is-gated-on-the-same-sli-recording-rule-as-the-alerts-and-the-freeze) |
+
+---
+
 ## ADR-001: Developers cannot set limits, security context, rollout strategy, probes, or canary steps
 
 **Status:** Accepted (Day 1)
@@ -483,6 +500,15 @@ override annotation left on a claim mustn't switch the freeze off for every late
   audited.` The numbers come from the claim's status, and read `unknown` when it has none.
 - `failurePolicy: Fail`.
 
+**Why break-glass rather than a hard block.** A freeze with no way through turns a bad week into an
+outage. The release that fixes the errors is itself an image change, and so is rolling back a bad
+one: a hard block would reject both, while the budget kept burning. The people on call often know a
+change is safe when the numbers can't. So the webhook doesn't try to prevent every override. It
+makes each one deliberate and visible instead: the reason must be set in the same update, so it
+can't be left on by accident, and every use records who and why in a `BreakGlassUsed` Event. On
+Day 5 that is how the freeze demo shipped its hotfix, while the release it was waiting for stayed
+rejected.
+
 **Consequences.**
 - While the webhook can't answer, no ServiceClaim can be created or updated, including the
   finalizer the controller adds to a new claim. Status writes are not affected. With the controller
@@ -644,3 +670,38 @@ drift put back.
 - Rolling back a bad release means reverting its commit. Argo Rollouts already stopped the canary
   (ADR-022), but git keeps asking for the bad image until the revert.
 - `make deploy` still works, but Argo CD replaces anything it applies with what git says.
+
+---
+
+## ADR-024: paved is an operator, not a Helm chart
+
+**Status:** Accepted (Day 7, recording a choice made on Day 1)
+
+**Context.** A Helm chart could render the same objects from a values file: a Rollout, an HPA, a
+NetworkPolicy, alert rules, a dashboard. Charts are familiar, and they cost far less code than a
+controller. But the platform has to do things a chart can't do: keep the objects as they were
+declared after they are created, report how each service is doing, and let live SLO data decide
+whether a release may ship.
+
+**Decision.** paved is a controller behind its own API, `ServiceClaim`:
+- **It keeps objects the way they were declared.** A chart renders once, at install or upgrade.
+  The controller sees a deleted or edited object and puts it back: on Day 7 a deleted
+  PrometheusRule was back 100 to 257 ms after `kubectl delete` returned (README).
+- **It reports.** The claim's status carries the error budget, the burn rate, whether deploys are
+  frozen and whether the service is ready. A chart has no runtime state to report.
+- **Its policy runs on live data.** The freeze needs the budget from Prometheus, re-read every
+  minute, and an admission webhook that reads it when someone changes an image. A chart only knows
+  its values at render time.
+- **The API is the boundary.** A developer can set only what the CRD has fields for. Limits, probes,
+  security context and canary steps don't exist in the schema, rather than being values teams are
+  asked not to override (ADR-001).
+- **Derived values are code with tests.** Tier floors, exact decimal alert thresholds and budget maths
+  live in Go with unit tests, not in template arithmetic.
+
+**Consequences.**
+- There is more to own: Go code, a CRD to version, an envtest suite, and the operator's own delivery
+  (ADR-023).
+- A bug in the controller reaches every service at once. The tests, fail-open (ADR-014) and the canary
+  gate on the operator's own consumers limit the damage, but don't remove it.
+- Helm is still used where rendering once is right: `hack/cluster-up.sh` installs cert-manager,
+  Traefik, Argo Rollouts, kube-prometheus-stack and Argo CD with it.
