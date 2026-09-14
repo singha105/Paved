@@ -297,12 +297,13 @@ deploy/              what Argo CD applies: the app-of-apps, the operator overlay
 services/shortlink/  the second service: a URL shortener in its own module
 examples/testsvc/    the test service behind url-shortener and webhook-delivery
 demo/                demo scripts and their asciinema recordings
-docs/                runbooks the alerts link to, and the demo GIFs
+docs/                high- and low-level design, runbooks the alerts link to, and the demo GIFs
 hack/                cluster bootstrap, make demo, image scripts
 infra/aws/           Terraform for the optional AWS link: public issuer, OIDC provider, boundary, ACK roles
 ```
 
-**Read next:** [DECISIONS.md](DECISIONS.md) for why each piece is the way it is,
+**Read next:** [docs/HLD.md](docs/HLD.md) for the high-level design, [docs/LLD.md](docs/LLD.md) for the
+low-level design, [DECISIONS.md](DECISIONS.md) for why each piece is the way it is,
 [POSTMORTEM.md](POSTMORTEM.md) for the worst bug of the week, and [PROGRESS.md](PROGRESS.md) for the
 day-by-day build with the output that proves each step.
 
